@@ -48,10 +48,11 @@ jobs:
           name: RouterOS-7.5-Patched
           path: output/*
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+    - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: v7.5-patched-${{ github.run_id }} # 自动生成唯一的 Tag 名
+          name: RouterOS 7.5 Patched Release
           files: |
             output/chr-7.5.img.zip
             output/all_packages-x86-7.5.zip
