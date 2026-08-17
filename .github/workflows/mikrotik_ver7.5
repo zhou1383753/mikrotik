@@ -1,0 +1,62 @@
+name: Build and Release RouterOS 7.5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget zip unzip p7zip-full
+
+      - name: Download & Patch RouterOS 7.5 Install Image
+        run: |
+          mkdir -p output
+
+          # 1. 下载官方 x86 Install Image ISO 镜像
+          wget -q https://download.mikrotik.com/routeros/7.5/mikrotik-7.5.iso -O install-image-7.5.iso
+
+          # 2. 如果存在 patch.py，对 ISO/镜像进行修补
+          if [ -f "patch.py" ]; then
+            python3 patch.py install-image-7.5.iso || python3 patch.py netinstall install-image-7.5.iso || true
+          fi
+
+          # 3. 打包生成 install-image-7.5.zip
+          zip -j output/install-image-7.5.zip install-image-7.5.iso
+
+          # 4. 同步下载 x86 扩展软件包扩展包 (all_packages)
+          wget -q https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
+          cp all_packages-x86-7.5.zip output/
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-7.5-Install-Image
+          path: output/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v7.5-install-${{ github.run_id }}
+          name: RouterOS 7.5 Install Image (x86)
+          body: "Auto-built RouterOS 7.5 x86 installer package."
+          files: |
+            output/install-image-7.5.zip
+            output/all_packages-x86-7.5.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
