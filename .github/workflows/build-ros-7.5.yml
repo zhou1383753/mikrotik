@@ -48,7 +48,7 @@ jobs:
           name: RouterOS-7.5-Patched
           path: output/*
 
-    - name: Create GitHub Release
+     - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v7.5-patched-${{ github.run_id }} # 自动生成唯一的 Tag 名
