@@ -13,7 +13,3 @@
 ## generate key for firmware downloaded from the repo [keygen](https://keygen.fjrcn.com/)
 
 
-# 强烈谴责此用户商用行为，使用该网站一次性生成超过10个key。请各位留意二手市场中 software-id 为以下几个的（根据IP属地，发货地可能是中国贵州）
-
-# We strongly condemn this user's commercial behavior of generating over 10 keys at once using this website. Please be aware of the following software IDs in the secondhand market (based on IP location, the shipping origin may be Guizhou, China):
-![condemn](image/condemned.png)
