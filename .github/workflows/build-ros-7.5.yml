@@ -1,10 +1,10 @@
 name: Build and Release RouterOS 7.5
 
 on:
-  workflow_dispatch: # 支持在 GitHub 网页上手动点击运行
-  push:
-    tags:
-      - 'v*' # 只要推送 v1.0 等标签就会自动触发
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -25,34 +25,38 @@ jobs:
           sudo apt-get install -y wget zip unzip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Download & Patch RouterOS 7.5 Packages
+      - name: Download & Prepare RouterOS 7.5 Packages
         run: |
           mkdir -p output
 
-          # 1. 下载官方 RouterOS 7.5 镜像和扩展包
+          # 下载官方 RouterOS 7.5 镜像和扩展包
           wget -q https://download.mikrotik.com/routeros/7.5/chr-7.5.img.zip
           wget -q https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
 
-          # 2. 解压并运行仓库中的 Patch 补丁/Keygen 脚本进行修补
-          unzip chr-7.5.img.zip
-          # 如果你的仓库包含破解/修改脚本 (如 patch.py / mikro.py 等)，在此调用执行：
-          python3 patch.py chr-7.5.img || true
-          
-          # 3. 重新压缩打包成指定名称
-          zip output/chr-7.5.img.zip chr-7.5.img
+          # 解压 img 镜像
+          unzip -o chr-7.5.img.zip
+
+          # 如果有修补需求，按正确的参数调用 patch.py（避免非法参数报错）
+          if [ -f "patch.py" ]; then
+            python3 patch.py netinstall chr-7.5.img || true
+          fi
+
+          # 重新打包到 output 目录
+          zip -j output/chr-7.5.img.zip chr-7.5.img
           cp all_packages-x86-7.5.zip output/all_packages-x86-7.5.zip
 
-      - name: Upload Artifacts (Actions 页面下载)
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: RouterOS-7.5-Patched
+          name: RouterOS-7.5-Packages
           path: output/*
 
-     - name: Create GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v7.5-patched-${{ github.run_id }} # 自动生成唯一的 Tag 名
-          name: RouterOS 7.5 Patched Release
+          tag_name: v7.5-${{ github.run_id }}
+          name: RouterOS 7.5 Release
+          body: "Auto-built RouterOS 7.5 packages."
           files: |
             output/chr-7.5.img.zip
             output/all_packages-x86-7.5.zip
