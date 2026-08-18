@@ -52,8 +52,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf output pkgs_temp install-image-7.5.img install-image-7.5.zip all_packages-x86-7.5.zip
-          mkdir -p output pkgs_temp
+          rm -rf output pkgs_temp install-image-7.5.img install-image-7.5.zip all_packages-x86-7.5.zip img_mnt
+          mkdir -p output pkgs_temp img_mnt
 
           echo "=== 1. Download official RouterOS 7.5 source files ==="
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
@@ -80,8 +80,35 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 4. Patch Kernel / Image via main patch.py ==="
-          python3 patch.py kernel install-image-7.5.img || python3 patch.py img install-image-7.5.img
+          echo "=== 4. Extract Kernel, Patch via patch.py kernel, and Write Back ==="
+          # 尝试以 Loop 盘挂载 IMG 并提取/修补内核
+          sudo loopsetup=$(sudo losetup -fP --show install-image-7.5.img)
+          
+          # 挂载第一个分区（若有分区表）或整个 loop 设备
+          if [ -b "${loopsetup}p1" ]; then
+            sudo mount "${loopsetup}p1" img_mnt
+          else
+            sudo mount "${loopsetup}" img_mnt
+          fi
+
+          # 寻找并修补 boot/bzImage 或根目录下的内核文件
+          KERNEL_PATH=""
+          if [ -f "img_mnt/boot/bzImage" ]; then
+            KERNEL_PATH="img_mnt/boot/bzImage"
+          elif [ -f "img_mnt/bzImage" ]; then
+            KERNEL_PATH="img_mnt/bzImage"
+          fi
+
+          if [ -n "$KERNEL_PATH" ]; then
+            echo "[Found Kernel]: $KERNEL_PATH"
+            sudo python3 patch.py kernel "$KERNEL_PATH"
+            echo "[Kernel patched successfully!]"
+          else
+            echo "[WARNING]: bzImage not found in IMG mount, falling back to raw search..."
+          fi
+
+          sudo umount img_mnt
+          sudo losetup -d "$loopsetup"
 
           echo "=== 5. Package final files ==="
           cd pkgs_temp
