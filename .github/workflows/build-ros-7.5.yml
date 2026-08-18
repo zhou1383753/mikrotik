@@ -19,12 +19,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install Dependencies & Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget zip unzip p7zip-full
+          sudo apt-get install -y wget zip unzip p7zip-full kpartx cpio sqfs-tools jq
 
-      - name: Download, Patch & Sign RouterOS 7.5 Packages
+      - name: Download, Patch & Build RouterOS 7.5 Install Image
         env:
           MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
           MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
@@ -39,7 +39,7 @@ jobs:
           mkdir -p output
           mkdir -p pkgs_temp
 
-          echo "=== 1. 下载 RouterOS 7.5 x86 安装包与扩展包 ==="
+          echo "=== 1. 下载官方 RouterOS 7.5 源文件 ==="
           wget https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
           wget https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
 
@@ -47,11 +47,10 @@ jobs:
           unzip -o install-image-7.5.zip
           unzip -o all_packages-x86-7.5.zip -d pkgs_temp/
 
-          echo "=== 3. 批量处理 NPK 补丁与重签名 ==="
+          echo "=== 3. 针对所有 NPK 文件进行修补与重新签名 ==="
           cd pkgs_temp
           for f in *.npk; do
             if [ -f "$f" ]; then
-              echo "----------------------------------------"
               echo "[Processing NPK]: $f"
               python3 ../patch.py npk "$f"
               python3 ../npk.py sign "$f" "$f"
@@ -59,14 +58,17 @@ jobs:
           done
           cd ..
 
-          echo "=== 4. 针对 Install Image 镜像修补 ==="
+          echo "=== 4. 针对安装镜像 (.img) 进行内核与引导层修补 ==="
           IMG_FILE=$(ls install-image-*.img 2>/dev/null | head -n 1)
           if [ -n "$IMG_FILE" ]; then
-            echo "[Processing IMG]: $IMG_FILE"
-            python3 patch.py "$IMG_FILE" || python3 patch.py netinstall "$IMG_FILE" || true
+            echo "[Patching Kernel & Block in IMG]: $IMG_FILE"
+            python3 patch.py block "$IMG_FILE" || true
+            python3 patch.py kernel "$IMG_FILE" || true
+            python3 patch.py netinstall "$IMG_FILE" || true
+            python3 patch.py "$IMG_FILE" || true
           fi
 
-          echo "=== 5. 打包生成输出文件 ==="
+          echo "=== 5. 打包最终文件包 ==="
           cd pkgs_temp
           zip -r ../output/all_packages-x86-7.5.zip *.npk
           cd ..
@@ -75,7 +77,7 @@ jobs:
             zip -j output/install-image-7.5.zip "$IMG_FILE"
           fi
 
-          echo "=== 构建完成！产物列表： ==="
+          echo "=== 构建完成！产物确认： ==="
           ls -lh output/
 
       - name: Upload Artifacts
@@ -89,7 +91,7 @@ jobs:
         with:
           tag_name: v7.5-patched-${{ github.run_id }}
           name: RouterOS 7.5 Patched Release (x86)
-          body: "Auto-built and signed RouterOS 7.5 x86 install image and packages."
+          body: "Auto-built and patched RouterOS 7.5 x86 image."
           files: |
             output/install-image-7.5.zip
             output/all_packages-x86-7.5.zip
