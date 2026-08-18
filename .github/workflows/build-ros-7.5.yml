@@ -80,18 +80,15 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 4. Extract Kernel, Patch via patch.py kernel, and Write Back ==="
-          # 尝试以 Loop 盘挂载 IMG 并提取/修补内核
-          sudo loopsetup=$(sudo losetup -fP --show install-image-7.5.img)
+          echo "=== 4. Mount IMG, Patch Kernel via patch.py kernel ==="
+          LOOP_DEV=$(sudo losetup -fP --show install-image-7.5.img)
           
-          # 挂载第一个分区（若有分区表）或整个 loop 设备
-          if [ -b "${loopsetup}p1" ]; then
-            sudo mount "${loopsetup}p1" img_mnt
+          if [ -b "${LOOP_DEV}p1" ]; then
+            sudo mount "${LOOP_DEV}p1" img_mnt
           else
-            sudo mount "${loopsetup}" img_mnt
+            sudo mount "${LOOP_DEV}" img_mnt
           fi
 
-          # 寻找并修补 boot/bzImage 或根目录下的内核文件
           KERNEL_PATH=""
           if [ -f "img_mnt/boot/bzImage" ]; then
             KERNEL_PATH="img_mnt/boot/bzImage"
@@ -104,11 +101,12 @@ jobs:
             sudo python3 patch.py kernel "$KERNEL_PATH"
             echo "[Kernel patched successfully!]"
           else
-            echo "[WARNING]: bzImage not found in IMG mount, falling back to raw search..."
+            echo "ERROR: Kernel file (bzImage) not found inside img_mnt"
+            exit 1
           fi
 
           sudo umount img_mnt
-          sudo losetup -d "$loopsetup"
+          sudo losetup -d "$LOOP_DEV"
 
           echo "=== 5. Package final files ==="
           cd pkgs_temp
