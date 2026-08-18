@@ -55,8 +55,9 @@ jobs:
           rm -rf output pkgs_temp install-image-7.5.img install-image-7.5.zip all_packages-x86-7.5.zip img_mnt
           mkdir -p output pkgs_temp img_mnt
 
-          echo "=== 1. Install kpartx ==="
-          sudo apt-get update -qq && sudo apt-get install -y -qq kpartx
+          echo "=== 1. Install dependencies ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dosfstools
 
           echo "=== 2. Download official RouterOS 7.5 source files ==="
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
@@ -83,41 +84,41 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 5. Map IMG partitions via kpartx, Patch bzImage via patch.py kernel ==="
-          # 使用 kpartx 创建分区设备映射
-          MAP_DEV=$(sudo kpartx -av install-image-7.5.img | awk 'NR==1 {print $3}')
-          
-          # 挂载第一个映射出来的分区
-          sudo mount /dev/mapper/$MAP_DEV img_mnt
+          echo "=== 5. Patch install-image kernel (losetup, no kpartx) ==="
+          # 官方 install-image 是整盘 FAT 镜像，不是带分区表的磁盘，不能用 kpartx
+          LOOP=$(sudo losetup -f --show install-image-7.5.img)
+          echo "Loop device: $LOOP"
+          sudo mount "$LOOP" img_mnt
 
-          # 列出挂载点目录结构（方便排错与确认）
           echo "=== Mounted Partition Content ==="
           ls -la img_mnt/
 
-          # 寻找并修补 bzImage
           KERNEL_PATH=""
-          if [ -f "img_mnt/boot/bzImage" ]; then
+          if [ -f "img_mnt/LINUX" ]; then
+            KERNEL_PATH="img_mnt/LINUX"
+          elif [ -f "img_mnt/linux" ]; then
+            KERNEL_PATH="img_mnt/linux"
+          elif [ -f "img_mnt/boot/bzImage" ]; then
             KERNEL_PATH="img_mnt/boot/bzImage"
           elif [ -f "img_mnt/bzImage" ]; then
             KERNEL_PATH="img_mnt/bzImage"
-          elif [ -f "img_mnt/linux" ]; then
-            KERNEL_PATH="img_mnt/linux"
           fi
 
-          if [ -n "$KERNEL_PATH" ]; then
-            echo "[Found Kernel]: $KERNEL_PATH"
-            sudo python3 patch.py kernel "$KERNEL_PATH"
-            echo "[Kernel patched successfully!]"
-          else
-            echo "ERROR: Kernel file not found in image partition"
-            sudo umount img_mnt
-            sudo kpartx -dv install-image-7.5.img
+          if [ -z "$KERNEL_PATH" ]; then
+            echo "ERROR: Kernel file not found in install-image"
+            ls -laR img_mnt/ || true
+            sudo umount img_mnt || true
+            sudo losetup -d "$LOOP" || true
             exit 1
           fi
 
-          # 卸载并清除设备映射，确保变更写回 .img 文件
+          echo "[Found Kernel]: $KERNEL_PATH"
+          sudo python3 patch.py kernel "$KERNEL_PATH"
+          echo "[Kernel patched successfully]"
+
+          sync
           sudo umount img_mnt
-          sudo kpartx -dv install-image-7.5.img
+          sudo losetup -d "$LOOP"
 
           echo "=== 6. Package final files ==="
           cd pkgs_temp
