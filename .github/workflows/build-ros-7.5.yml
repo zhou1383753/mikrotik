@@ -24,22 +24,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wget zip unzip p7zip-full
 
-      - name: Download & Patch RouterOS 7.5 Install Image
+      - name: Download & Patch RouterOS 7.5 Install IMG
         run: |
           mkdir -p output
 
-          # 1. 下载官方 x86 Install Image ISO 镜像
-          wget -q https://download.mikrotik.com/routeros/7.5/mikrotik-7.5.iso -O install-image-7.5.iso
+          # 1. 下载官方 x86 Install Image 压缩包
+          wget -q https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
+          unzip -o install-image-7.5.zip
 
-          # 2. 如果存在 patch.py，对 ISO/镜像进行修补
-          if [ -f "patch.py" ]; then
-            python3 patch.py install-image-7.5.iso || python3 patch.py netinstall install-image-7.5.iso || true
+          # 2. 找到解压出的 .img 文件
+          IMG_FILE=$(ls install-image-*.img 2>/dev/null | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            IMG_FILE="install-image-7.5.img"
           fi
 
-          # 3. 打包生成 install-image-7.5.zip
-          zip -j output/install-image-7.5.zip install-image-7.5.iso
+          # 3. 如果仓库中有 patch.py，执行修补
+          if [ -f "patch.py" ]; then
+            python3 patch.py "$IMG_FILE" || python3 patch.py netinstall "$IMG_FILE" || true
+          fi
 
-          # 4. 同步下载 x86 扩展软件包扩展包 (all_packages)
+          # 4. 重新打包为 install-image-7.5.zip
+          zip -j output/install-image-7.5.zip "$IMG_FILE"
+
+          # 5. 同步下载 x86 扩展软件包 (all_packages)
           wget -q https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
           cp all_packages-x86-7.5.zip output/
 
@@ -52,9 +59,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v7.5-install-${{ github.run_id }}
-          name: RouterOS 7.5 Install Image (x86)
-          body: "Auto-built RouterOS 7.5 x86 installer package."
+          tag_name: v7.5-img-${{ github.run_id }}
+          name: RouterOS 7.5 Install Image (IMG Format)
+          body: "Auto-built RouterOS 7.5 x86 install-image (.img) package."
           files: |
             output/install-image-7.5.zip
             output/all_packages-x86-7.5.zip
