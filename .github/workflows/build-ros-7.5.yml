@@ -35,8 +35,8 @@ jobs:
           mkdir -p pkgs_temp
 
           echo "=== 1. 下载官方 RouterOS 7.5 源文件 ==="
-          wget https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
-          wget https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
+          wget -q --show-progress https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
+          wget -q --show-progress https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
 
           echo "=== 2. 解压文件 ==="
           unzip -o install-image-7.5.zip
@@ -54,13 +54,20 @@ jobs:
           cd ..
 
           echo "=== 4. 针对安装镜像 (.img) 进行内核与引导层修补 ==="
-          IMG_FILE=$(ls install-image-*.img 2>/devnull | head -n 1)
-          if [ -n "$IMG_FILE" ]; then
-            echo "[Patching Kernel & Block in IMG]: $IMG_FILE"
+          IMG_FILE=$(ls install-image-*.img 2>/dev/null | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            IMG_FILE="install-image-7.5.img"
+          fi
+
+          if [ -f "$IMG_FILE" ]; then
+            echo "[Found IMG File]: $IMG_FILE"
             python3 patch.py block "$IMG_FILE" || true
             python3 patch.py kernel "$IMG_FILE" || true
             python3 patch.py netinstall "$IMG_FILE" || true
             python3 patch.py "$IMG_FILE" || true
+          else
+            echo "[ERROR]: 未找到 $IMG_FILE 镜像！"
+            exit 1
           fi
 
           echo "=== 5. 打包最终文件包 ==="
@@ -68,9 +75,7 @@ jobs:
           zip -r ../output/all_packages-x86-7.5.zip *.npk
           cd ..
 
-          if [ -n "$IMG_FILE" ]; then
-            zip -j output/install-image-7.5.zip "$IMG_FILE"
-          fi
+          zip -j output/install-image-7.5.zip "$IMG_FILE"
 
           echo "=== 构建完成！产物确认： ==="
           ls -lh output/
