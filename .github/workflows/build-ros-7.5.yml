@@ -57,24 +57,19 @@ jobs:
           IMG_FILE="install-image-7.5.img"
           if [ -f "$IMG_FILE" ]; then
             echo "[Found IMG File]: $IMG_FILE"
-            if [ -f "patch_img.py" ]; then
-              python3 patch_img.py "$IMG_FILE"
-            else
-              echo "[Replacing Key in IMG via Python]..."
-              python3 -c '
+            python3 -c "
 import sys
-m = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
-c = bytes.fromhex("9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709")
-with open("install-image-7.5.img", "rb") as f:
+m = bytes.fromhex('C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59')
+c = bytes.fromhex('9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709')
+with open('install-image-7.5.img', 'rb') as f:
     d = f.read()
 cnt = d.count(m)
-print(f"[*] Found {cnt} pubkey match(es) in IMG")
+print(f'[*] Found {cnt} pubkey match(es) in IMG')
 if cnt > 0:
-    with open("install-image-7.5.img", "wb") as f:
+    with open('install-image-7.5.img', 'wb') as f:
         f.write(d.replace(m, c))
-    print("[+] IMG Key Replacement Done!")
-'
-            fi
+    print('[+] IMG Key Replacement Done!')
+"
           else
             echo "[ERROR]: 未找到 $IMG_FILE"
             exit 1
