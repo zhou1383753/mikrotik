@@ -113,7 +113,8 @@ jobs:
           fi
 
           echo "[Found Kernel]: $KERNEL_PATH"
-          sudo python3 patch.py kernel "$KERNEL_PATH"
+          # -E 保留环境变量，否则 sudo 会丢掉 MIKRO_* / CUSTOM_* 密钥
+          sudo -E python3 patch.py kernel "$KERNEL_PATH"
           echo "[Kernel patched successfully]"
 
           sync
