@@ -9,7 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Code
@@ -38,7 +38,7 @@ jobs:
           echo "=== Checking Python syntax ==="
           python3 -m py_compile patch.py npk.py
 
-      - name: Download, Patch & Build RouterOS 7.5 Install Image
+      - name: Download, Patch & Build RouterOS 7.5 (elseif style)
         env:
           MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
           MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
@@ -52,30 +52,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf output pkgs_temp install-image-7.5.img install-image-7.5.zip all_packages-x86-7.5.zip img_mnt
-          mkdir -p output pkgs_temp img_mnt
+          VERSION="7.5"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK"/{iso,new_iso,efiboot,install,pkgs} "$OUT"
 
           echo "=== 1. Install dependencies ==="
           sudo apt-get update -qq
-          sudo apt-get install -y -qq dosfstools
+          sudo apt-get install -y -qq \
+            dosfstools syslinux isolinux syslinux-common \
+            xorriso wget unzip
 
-          echo "=== 2. Download official RouterOS 7.5 source files ==="
-          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
-            https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
-          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
-            https://download.mikrotik.com/routeros/7.5/all_packages-x86-7.5.zip
+          echo "=== 2. Download official sources ==="
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/mikrotik-${VERSION}.iso" \
+            "https://download.mikrotik.com/routeros/${VERSION}/mikrotik-${VERSION}.iso"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-x86-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-x86-${VERSION}.zip"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/refind-bin-0.14.2.zip" \
+            "https://downloads.sourceforge.net/project/refind/0.14.2/refind-bin-0.14.2.zip"
 
-          test -s install-image-7.5.zip
-          test -s all_packages-x86-7.5.zip
+          test -s "$WORK/mikrotik-${VERSION}.iso"
+          test -s "$WORK/all_packages-x86-${VERSION}.zip"
+          test -s "$WORK/refind-bin-0.14.2.zip"
 
-          echo "=== 3. Extract files ==="
-          unzip -o install-image-7.5.zip
-          unzip -o all_packages-x86-7.5.zip -d pkgs_temp/
-          test -s install-image-7.5.img
+          echo "=== 3. Unpack ISO (取 efiboot.img) ==="
+          sudo mount -o loop,ro "$WORK/mikrotik-${VERSION}.iso" "$WORK/iso"
+          cp -v "$WORK/iso/efiboot.img" "$WORK/new_iso/"
+          # ISO 里也可能有 npk，一并拷贝（后面以 all_packages 为准再覆盖）
+          cp -v "$WORK/iso/"*.npk "$WORK/pkgs/" 2>/dev/null || true
+          sudo umount "$WORK/iso"
 
-          echo "=== 4. Patch and re-sign all NPK files ==="
+          echo "=== 4. Extract & patch/sign all NPK packages ==="
+          unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/pkgs/"
           shopt -s nullglob
-          npk_files=(pkgs_temp/*.npk)
+          npk_files=("$WORK"/pkgs/*.npk)
           test "${#npk_files[@]}" -gt 0
 
           for f in "${npk_files[@]}"; do
@@ -84,54 +98,110 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 5. Patch install-image kernel (losetup, no kpartx) ==="
-          # 官方 install-image 是整盘 FAT 镜像，不是带分区表的磁盘，不能用 kpartx
-          LOOP=$(sudo losetup -f --show install-image-7.5.img)
-          echo "Loop device: $LOOP"
-          sudo mount "$LOOP" img_mnt
+          echo "=== 5. Patch kernel from efiboot.img (对齐 elseif) ==="
+          sudo mount -o loop "$WORK/new_iso/efiboot.img" "$WORK/efiboot"
+          ls -la "$WORK/efiboot/" || true
+          ls -la "$WORK/efiboot/EFI/BOOT/" 2>/dev/null || true
 
-          echo "=== Mounted Partition Content ==="
-          ls -la img_mnt/
-
-          KERNEL_PATH=""
-          if [ -f "img_mnt/LINUX" ]; then
-            KERNEL_PATH="img_mnt/LINUX"
-          elif [ -f "img_mnt/linux" ]; then
-            KERNEL_PATH="img_mnt/linux"
-          elif [ -f "img_mnt/boot/bzImage" ]; then
-            KERNEL_PATH="img_mnt/boot/bzImage"
-          elif [ -f "img_mnt/bzImage" ]; then
-            KERNEL_PATH="img_mnt/bzImage"
-          fi
-
-          if [ -z "$KERNEL_PATH" ]; then
-            echo "ERROR: Kernel file not found in install-image"
-            ls -laR img_mnt/ || true
-            sudo umount img_mnt || true
-            sudo losetup -d "$LOOP" || true
+          # x86 ISO 的内核一般在 efiboot 根目录 linux.x86_64
+          KERNEL_SRC=""
+          if [ -f "$WORK/efiboot/linux.x86_64" ]; then
+            KERNEL_SRC="$WORK/efiboot/linux.x86_64"
+          elif [ -f "$WORK/efiboot/linux" ]; then
+            KERNEL_SRC="$WORK/efiboot/linux"
+          elif [ -f "$WORK/efiboot/EFI/BOOT/BOOTX64.EFI" ]; then
+            KERNEL_SRC="$WORK/efiboot/EFI/BOOT/BOOTX64.EFI"
+          else
+            echo "ERROR: kernel not found in efiboot.img"
+            find "$WORK/efiboot" -type f | head -50
+            sudo umount "$WORK/efiboot" || true
             exit 1
           fi
 
-          echo "[Found Kernel]: $KERNEL_PATH"
-          # -E 保留环境变量，否则 sudo 会丢掉 MIKRO_* / CUSTOM_* 密钥
-          sudo -E python3 patch.py kernel "$KERNEL_PATH"
-          echo "[Kernel patched successfully]"
+          echo "[Found kernel in efiboot]: $KERNEL_SRC"
+          # 先写到工作目录，避免直接写只读/挂载点权限问题
+          sudo -E python3 patch.py kernel "$KERNEL_SRC" -O "$WORK/linux.patched"
+          sudo umount "$WORK/efiboot"
+          test -s "$WORK/linux.patched"
+          echo "[Kernel patched OK]: $(ls -lh "$WORK/linux.patched")"
+
+          echo "=== 6. Create install-image from scratch (elseif style) ==="
+          IMG="$WORK/install-image-${VERSION}.img"
+          truncate --size 128M "$IMG"
+          mkfs.vfat -I -F 32 -n "Install" "$IMG"
+
+          LOOP=$(sudo losetup -f --show "$IMG")
+          echo "Loop device: $LOOP"
+          # 安装 syslinux 引导到该分区设备
+          sudo syslinux --install "$LOOP"
+
+          sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$LOOP" "$WORK/install"
+
+          # 已 patch 的内核
+          cp -vf "$WORK/linux.patched" "$WORK/install/linux"
+
+          # BIOS syslinux 模块
+          cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 "$WORK/install/"
+
+          # EFI: rEFInd
+          mkdir -p "$WORK/install/EFI/BOOT"
+          unzip -j "$WORK/refind-bin-0.14.2.zip" \
+            "refind-bin-0.14.2/refind/refind_x64.efi" \
+            -d "$WORK/install/EFI/BOOT"
+          mv "$WORK/install/EFI/BOOT/refind_x64.efi" "$WORK/install/EFI/BOOT/BOOTX64.EFI"
+
+          cat > "$WORK/install/EFI/BOOT/refind.conf" << 'EOF'
+          timeout 0
+          textonly
+          textmode 0
+          showtools shutdown, reboot, exit
+          menuentry "Install RouterOS" {
+            loader /linux
+            options "load_ramdisk=1 root=/dev/ram0 -install -hdd"
+          }
+          default_selection /EFI/BOOT/BOOTX64.EFI
+          EOF
+
+          cat > "$WORK/install/syslinux.cfg" << 'EOF'
+          default system
+          LABEL system
+            KERNEL linux
+            APPEND load_ramdisk=1 -install -hdd
+          EOF
+
+          # 把已签名的 npk 按 1.npk 2.npk ... 放入镜像（安装器会读这些）
+          i=1
+          for f in "$WORK"/pkgs/*.npk; do
+            echo "$f => ${i}.npk"
+            cp -vf "$f" "$WORK/install/${i}.npk"
+            i=$((i + 1))
+          done
+
+          touch "$WORK/install/CHOOSE"
+          touch "$WORK/install/autorun.scr"
+
+          echo "=== install-image content ==="
+          ls -la "$WORK/install/"
+          ls -la "$WORK/install/EFI/BOOT/" || true
 
           sync
-          sudo umount img_mnt
+          sudo umount "$WORK/install"
           sudo losetup -d "$LOOP"
 
-          echo "=== 6. Package final files ==="
-          cd pkgs_temp
-          zip -r ../output/all_packages-x86-7.5.zip ./*.npk
-          cd ..
+          echo "=== 7. Package outputs ==="
+          (
+            cd "$WORK/pkgs"
+            zip -r "$OUT/all_packages-x86-${VERSION}.zip" ./*.npk
+          )
+          (
+            cd "$WORK"
+            zip -j "$OUT/install-image-${VERSION}.zip" "install-image-${VERSION}.img"
+          )
 
-          zip -j output/install-image-7.5.zip install-image-7.5.img
-
-          echo "=== 7. Verify output files ==="
-          test -s output/install-image-7.5.zip
-          test -s output/all_packages-x86-7.5.zip
-          ls -lh output/
+          echo "=== 8. Verify ==="
+          test -s "$OUT/install-image-${VERSION}.zip"
+          test -s "$OUT/all_packages-x86-${VERSION}.zip"
+          ls -lh "$OUT/"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -146,7 +216,14 @@ jobs:
           tag_name: v7.5-patched-${{ github.run_id }}
           name: RouterOS 7.5 Patched Release (x86)
           body: |
-            Auto-built and patched RouterOS 7.5 x86 image.
+            Built like elseif/MikroTikPatch: custom install-image from scratch.
+            - Kernel patched from ISO efiboot.img
+            - All NPK re-signed
+            - Packages embedded as 1.npk, 2.npk, ... inside install-image
+
+            License public key (must match your private key):
+            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
+
             Workflow run: ${{ github.run_id }}
           files: |
             output/install-image-7.5.zip
