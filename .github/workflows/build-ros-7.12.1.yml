@@ -1,0 +1,231 @@
+name: Build and Release RouterOS 7.12.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate build environment
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Checking required files ==="
+          test -f patch.py
+          test -f npk.py
+
+          echo "=== Checking required secrets ==="
+          test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_NPK_SIGN_PRIVATE_KEY is not configured"; exit 1; }
+          test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_LICENSE_PRIVATE_KEY is not configured"; exit 1; }
+
+          echo "=== Checking Python syntax ==="
+          python3 -m py_compile patch.py npk.py
+
+      - name: Download, Patch & Build RouterOS 7.12.1 (elseif style)
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+
+          VERSION="7.12.1"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK"/{iso,new_iso,efiboot,install,pkgs} "$OUT"
+
+          echo "=== 1. Install dependencies ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            dosfstools syslinux isolinux syslinux-common \
+            xorriso wget unzip
+
+          echo "=== 2. Download official sources ==="
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/mikrotik-${VERSION}.iso" \
+            "https://download.mikrotik.com/routeros/${VERSION}/mikrotik-${VERSION}.iso"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-x86-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-x86-${VERSION}.zip"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/refind-bin-0.14.2.zip" \
+            "https://downloads.sourceforge.net/project/refind/0.14.2/refind-bin-0.14.2.zip"
+
+          test -s "$WORK/mikrotik-${VERSION}.iso"
+          test -s "$WORK/all_packages-x86-${VERSION}.zip"
+          test -s "$WORK/refind-bin-0.14.2.zip"
+
+          echo "=== 3. Unpack ISO (取 efiboot.img) ==="
+          sudo mount -o loop,ro "$WORK/mikrotik-${VERSION}.iso" "$WORK/iso"
+          cp -v "$WORK/iso/efiboot.img" "$WORK/new_iso/"
+          cp -v "$WORK/iso/"*.npk "$WORK/pkgs/" 2>/dev/null || true
+          sudo umount "$WORK/iso"
+
+          echo "=== 4. Extract & patch/sign all NPK packages ==="
+          unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/pkgs/"
+
+          # ISO / zip 里的文件可能是只读，必须先放开写权限
+          chmod -R u+w "$WORK/pkgs"
+
+          shopt -s nullglob
+          npk_files=("$WORK"/pkgs/*.npk)
+          test "${#npk_files[@]}" -gt 0
+
+          for f in "${npk_files[@]}"; do
+            echo "[Processing NPK]: $f"
+            python3 patch.py npk "$f"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          echo "=== 5. Patch kernel from efiboot.img (对齐 elseif) ==="
+          sudo mount -o loop "$WORK/new_iso/efiboot.img" "$WORK/efiboot"
+          ls -la "$WORK/efiboot/" || true
+          ls -la "$WORK/efiboot/EFI/BOOT/" 2>/dev/null || true
+
+          KERNEL_SRC=""
+          if [ -f "$WORK/efiboot/linux.x86_64" ]; then
+            KERNEL_SRC="$WORK/efiboot/linux.x86_64"
+          elif [ -f "$WORK/efiboot/linux" ]; then
+            KERNEL_SRC="$WORK/efiboot/linux"
+          elif [ -f "$WORK/efiboot/EFI/BOOT/BOOTX64.EFI" ]; then
+            KERNEL_SRC="$WORK/efiboot/EFI/BOOT/BOOTX64.EFI"
+          else
+            echo "ERROR: kernel not found in efiboot.img"
+            find "$WORK/efiboot" -type f | head -50
+            sudo umount "$WORK/efiboot" || true
+            exit 1
+          fi
+
+          echo "[Found kernel in efiboot]: $KERNEL_SRC"
+          sudo -E python3 patch.py kernel "$KERNEL_SRC" -O "$WORK/linux.patched"
+          sudo umount "$WORK/efiboot"
+          test -s "$WORK/linux.patched"
+          echo "[Kernel patched OK]: $(ls -lh "$WORK/linux.patched")"
+
+          echo "=== 6. Create install-image from scratch (elseif style) ==="
+          IMG="$WORK/install-image-${VERSION}.img"
+          truncate --size 128M "$IMG"
+          mkfs.vfat -I -F 32 -n "Install" "$IMG"
+
+          LOOP=$(sudo losetup -f --show "$IMG")
+          echo "Loop device: $LOOP"
+          sudo syslinux --install "$LOOP"
+
+          sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$LOOP" "$WORK/install"
+
+          cp -vf "$WORK/linux.patched" "$WORK/install/linux"
+          cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 "$WORK/install/"
+
+          mkdir -p "$WORK/install/EFI/BOOT"
+          unzip -j "$WORK/refind-bin-0.14.2.zip" \
+            "refind-bin-0.14.2/refind/refind_x64.efi" \
+            -d "$WORK/install/EFI/BOOT"
+          mv "$WORK/install/EFI/BOOT/refind_x64.efi" "$WORK/install/EFI/BOOT/BOOTX64.EFI"
+
+          cat > "$WORK/install/EFI/BOOT/refind.conf" << 'EOF'
+          timeout 0
+          textonly
+          textmode 0
+          showtools shutdown, reboot, exit
+          menuentry "Install RouterOS" {
+            loader /linux
+            options "load_ramdisk=1 root=/dev/ram0 -install -hdd"
+          }
+          default_selection /EFI/BOOT/BOOTX64.EFI
+          EOF
+
+          cat > "$WORK/install/syslinux.cfg" << 'EOF'
+          default system
+          LABEL system
+            KERNEL linux
+            APPEND load_ramdisk=1 -install -hdd
+          EOF
+
+          i=1
+          for f in "$WORK"/pkgs/*.npk; do
+            echo "$f => ${i}.npk"
+            cp -vf "$f" "$WORK/install/${i}.npk"
+            i=$((i + 1))
+          done
+
+          touch "$WORK/install/CHOOSE"
+          touch "$WORK/install/autorun.scr"
+
+          echo "=== install-image content ==="
+          ls -la "$WORK/install/"
+          ls -la "$WORK/install/EFI/BOOT/" || true
+
+          sync
+          sudo umount "$WORK/install"
+          sudo losetup -d "$LOOP"
+
+          echo "=== 7. Package outputs ==="
+          (
+            cd "$WORK/pkgs"
+            zip -r "$OUT/all_packages-x86-${VERSION}.zip" ./*.npk
+          )
+          (
+            cd "$WORK"
+            zip -j "$OUT/install-image-${VERSION}.zip" "install-image-${VERSION}.img"
+          )
+
+          echo "=== 8. Verify ==="
+          test -s "$OUT/install-image-${VERSION}.zip"
+          test -s "$OUT/all_packages-x86-${VERSION}.zip"
+          ls -lh "$OUT/"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-7.12.1-Patched-x86
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v7.12.1-patched-${{ github.run_id }}
+          name: RouterOS 7.12.1 Patched Release (x86)
+          body: |
+            Built like elseif/MikroTikPatch: custom install-image from scratch.
+            - Kernel patched from ISO efiboot.img
+            - All NPK re-signed
+            - Packages embedded as 1.npk, 2.npk, ... inside install-image
+
+            Outputs:
+            - install-image-7.12.1.zip
+            - all_packages-x86-7.12.1.zip
+
+            License public key (must match your private key):
+            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
+
+            Workflow run: ${{ github.run_id }}
+          files: |
+            output/install-image-7.12.1.zip
+            output/all_packages-x86-7.12.1.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
