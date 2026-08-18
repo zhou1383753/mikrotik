@@ -82,12 +82,15 @@ jobs:
           echo "=== 3. Unpack ISO (取 efiboot.img) ==="
           sudo mount -o loop,ro "$WORK/mikrotik-${VERSION}.iso" "$WORK/iso"
           cp -v "$WORK/iso/efiboot.img" "$WORK/new_iso/"
-          # ISO 里也可能有 npk，一并拷贝（后面以 all_packages 为准再覆盖）
           cp -v "$WORK/iso/"*.npk "$WORK/pkgs/" 2>/dev/null || true
           sudo umount "$WORK/iso"
 
           echo "=== 4. Extract & patch/sign all NPK packages ==="
           unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/pkgs/"
+
+          # ISO / zip 里的文件可能是只读，必须先放开写权限
+          chmod -R u+w "$WORK/pkgs"
+
           shopt -s nullglob
           npk_files=("$WORK"/pkgs/*.npk)
           test "${#npk_files[@]}" -gt 0
@@ -103,7 +106,6 @@ jobs:
           ls -la "$WORK/efiboot/" || true
           ls -la "$WORK/efiboot/EFI/BOOT/" 2>/dev/null || true
 
-          # x86 ISO 的内核一般在 efiboot 根目录 linux.x86_64
           KERNEL_SRC=""
           if [ -f "$WORK/efiboot/linux.x86_64" ]; then
             KERNEL_SRC="$WORK/efiboot/linux.x86_64"
@@ -119,7 +121,6 @@ jobs:
           fi
 
           echo "[Found kernel in efiboot]: $KERNEL_SRC"
-          # 先写到工作目录，避免直接写只读/挂载点权限问题
           sudo -E python3 patch.py kernel "$KERNEL_SRC" -O "$WORK/linux.patched"
           sudo umount "$WORK/efiboot"
           test -s "$WORK/linux.patched"
@@ -132,18 +133,13 @@ jobs:
 
           LOOP=$(sudo losetup -f --show "$IMG")
           echo "Loop device: $LOOP"
-          # 安装 syslinux 引导到该分区设备
           sudo syslinux --install "$LOOP"
 
           sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$LOOP" "$WORK/install"
 
-          # 已 patch 的内核
           cp -vf "$WORK/linux.patched" "$WORK/install/linux"
-
-          # BIOS syslinux 模块
           cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 "$WORK/install/"
 
-          # EFI: rEFInd
           mkdir -p "$WORK/install/EFI/BOOT"
           unzip -j "$WORK/refind-bin-0.14.2.zip" \
             "refind-bin-0.14.2/refind/refind_x64.efi" \
@@ -169,7 +165,6 @@ jobs:
             APPEND load_ramdisk=1 -install -hdd
           EOF
 
-          # 把已签名的 npk 按 1.npk 2.npk ... 放入镜像（安装器会读这些）
           i=1
           for f in "$WORK"/pkgs/*.npk; do
             echo "$f => ${i}.npk"
