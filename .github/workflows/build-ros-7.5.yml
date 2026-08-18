@@ -53,24 +53,16 @@ jobs:
           done
           cd ..
 
-          echo "=== 4. 针对安装镜像 (.img) 进行内核与引导层修补 ==="
-          IMG_FILE=$(ls install-image-*.img 2>/dev/null | head -n 1)
-          if [ -z "$IMG_FILE" ]; then
-            IMG_FILE="install-image-7.5.img"
-          fi
-
+          echo "=== 4. 针对安装镜像 (.img) 进行内核与引导修补 ==="
+          IMG_FILE=$(ls install-image-*.img 2>/devnull | head -n 1)
           if [ -f "$IMG_FILE" ]; then
-            echo "[Found IMG File]: $IMG_FILE"
-            python3 patch.py block "$IMG_FILE" || true
-            python3 patch.py kernel "$IMG_FILE" || true
-            python3 patch.py netinstall "$IMG_FILE" || true
-            python3 patch.py "$IMG_FILE" || true
+            python3 patch_img.py "$IMG_FILE"
           else
-            echo "[ERROR]: 未找到 $IMG_FILE 镜像！"
+            echo "[ERROR]: 未找到 $IMG_FILE"
             exit 1
           fi
 
-          echo "=== 5. 打包最终文件包 ==="
+          echo "=== 5. 打包最终产物 ==="
           cd pkgs_temp
           zip -r ../output/all_packages-x86-7.5.zip *.npk
           cd ..
