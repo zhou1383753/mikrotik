@@ -19,11 +19,6 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies & Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget zip unzip p7zip-full kpartx cpio squashfs-tools jq
-
       - name: Download, Patch & Build RouterOS 7.5 Install Image
         env:
           MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
