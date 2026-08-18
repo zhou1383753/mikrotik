@@ -22,7 +22,7 @@ jobs:
       - name: Install Dependencies & Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget zip unzip p7zip-full kpartx cpio sqfs-tools jq
+          sudo apt-get install -y wget zip unzip p7zip-full kpartx cpio squashfs-tools jq
 
       - name: Download, Patch & Build RouterOS 7.5 Install Image
         env:
@@ -59,7 +59,7 @@ jobs:
           cd ..
 
           echo "=== 4. 针对安装镜像 (.img) 进行内核与引导层修补 ==="
-          IMG_FILE=$(ls install-image-*.img 2>/dev/null | head -n 1)
+          IMG_FILE=$(ls install-image-*.img 2>/devnull | head -n 1)
           if [ -n "$IMG_FILE" ]; then
             echo "[Patching Kernel & Block in IMG]: $IMG_FILE"
             python3 patch.py block "$IMG_FILE" || true
