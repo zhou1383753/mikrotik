@@ -55,7 +55,10 @@ jobs:
           rm -rf output pkgs_temp install-image-7.5.img install-image-7.5.zip all_packages-x86-7.5.zip img_mnt
           mkdir -p output pkgs_temp img_mnt
 
-          echo "=== 1. Download official RouterOS 7.5 source files ==="
+          echo "=== 1. Install kpartx ==="
+          sudo apt-get update -qq && sudo apt-get install -y -qq kpartx
+
+          echo "=== 2. Download official RouterOS 7.5 source files ==="
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
             https://download.mikrotik.com/routeros/7.5/install-image-7.5.zip
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=30 --show-progress \
@@ -64,12 +67,12 @@ jobs:
           test -s install-image-7.5.zip
           test -s all_packages-x86-7.5.zip
 
-          echo "=== 2. Extract files ==="
+          echo "=== 3. Extract files ==="
           unzip -o install-image-7.5.zip
           unzip -o all_packages-x86-7.5.zip -d pkgs_temp/
           test -s install-image-7.5.img
 
-          echo "=== 3. Patch and re-sign all NPK files ==="
+          echo "=== 4. Patch and re-sign all NPK files ==="
           shopt -s nullglob
           npk_files=(pkgs_temp/*.npk)
           test "${#npk_files[@]}" -gt 0
@@ -80,20 +83,25 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 4. Mount IMG, Patch Kernel via patch.py kernel ==="
-          LOOP_DEV=$(sudo losetup -fP --show install-image-7.5.img)
+          echo "=== 5. Map IMG partitions via kpartx, Patch bzImage via patch.py kernel ==="
+          # 使用 kpartx 创建分区设备映射
+          MAP_DEV=$(sudo kpartx -av install-image-7.5.img | awk 'NR==1 {print $3}')
           
-          if [ -b "${LOOP_DEV}p1" ]; then
-            sudo mount "${LOOP_DEV}p1" img_mnt
-          else
-            sudo mount "${LOOP_DEV}" img_mnt
-          fi
+          # 挂载第一个映射出来的分区
+          sudo mount /dev/mapper/$MAP_DEV img_mnt
 
+          # 列出挂载点目录结构（方便排错与确认）
+          echo "=== Mounted Partition Content ==="
+          ls -la img_mnt/
+
+          # 寻找并修补 bzImage
           KERNEL_PATH=""
           if [ -f "img_mnt/boot/bzImage" ]; then
             KERNEL_PATH="img_mnt/boot/bzImage"
           elif [ -f "img_mnt/bzImage" ]; then
             KERNEL_PATH="img_mnt/bzImage"
+          elif [ -f "img_mnt/linux" ]; then
+            KERNEL_PATH="img_mnt/linux"
           fi
 
           if [ -n "$KERNEL_PATH" ]; then
@@ -101,21 +109,24 @@ jobs:
             sudo python3 patch.py kernel "$KERNEL_PATH"
             echo "[Kernel patched successfully!]"
           else
-            echo "ERROR: Kernel file (bzImage) not found inside img_mnt"
+            echo "ERROR: Kernel file not found in image partition"
+            sudo umount img_mnt
+            sudo kpartx -dv install-image-7.5.img
             exit 1
           fi
 
+          # 卸载并清除设备映射，确保变更写回 .img 文件
           sudo umount img_mnt
-          sudo losetup -d "$LOOP_DEV"
+          sudo kpartx -dv install-image-7.5.img
 
-          echo "=== 5. Package final files ==="
+          echo "=== 6. Package final files ==="
           cd pkgs_temp
           zip -r ../output/all_packages-x86-7.5.zip ./*.npk
           cd ..
 
           zip -j output/install-image-7.5.zip install-image-7.5.img
 
-          echo "=== 6. Verify output files ==="
+          echo "=== 7. Verify output files ==="
           test -s output/install-image-7.5.zip
           test -s output/all_packages-x86-7.5.zip
           ls -lh output/
