@@ -30,14 +30,13 @@ jobs:
           echo "=== Checking required files ==="
           test -f patch.py
           test -f npk.py
-          test -f patch_img.py
 
           echo "=== Checking required secrets ==="
           test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_NPK_SIGN_PRIVATE_KEY is not configured"; exit 1; }
           test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_LICENSE_PRIVATE_KEY is not configured"; exit 1; }
 
           echo "=== Checking Python syntax ==="
-          python3 -m py_compile patch.py npk.py patch_img.py
+          python3 -m py_compile patch.py npk.py
 
       - name: Download, Patch & Build RouterOS 7.5 Install Image
         env:
@@ -81,8 +80,8 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          echo "=== 4. Patch public key in install image ==="
-          python3 patch_img.py install-image-7.5.img
+          echo "=== 4. Patch Kernel / Image via main patch.py ==="
+          python3 patch.py kernel install-image-7.5.img || python3 patch.py img install-image-7.5.img
 
           echo "=== 5. Package final files ==="
           cd pkgs_temp
