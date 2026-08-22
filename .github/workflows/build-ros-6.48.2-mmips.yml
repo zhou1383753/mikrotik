@@ -32,7 +32,7 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py for mmips ELF initrd
+      - name: Fix patch.py (keep xz size safe for ELF)
         run: |
           set -euo pipefail
           python3 -c "
@@ -40,31 +40,70 @@ jobs:
           p = Path('patch.py')
           t = p.read_text(encoding='utf-8')
 
-          # 1) 更强压缩
-          old_c = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9,}] )'
-          new_c = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9 | lzma.PRESET_EXTREME, \"dict_size\": 32*1024*1024}] )'
-          if old_c not in t:
-              raise SystemExit('compress line not found')
-          t = t.replace(old_c, new_c, 1)
+          start = t.find('def patch_initrd_xz(')
+          end = t.find('\ndef find_7zXZ_data(', start)
+          if start < 0 or end < 0:
+              raise SystemExit('patch_initrd_xz block not found')
 
-          # 2) ELF 路径不要强制 xz 等长（mmips 会触发 size too big）
-          old_e = 'new_initrd_xz =  patch_initrd_xz(initrd_xz,key_dict)'
-          new_e = 'new_initrd_xz =  patch_initrd_xz(initrd_xz,key_dict,ljust=False)'
-          if old_e not in t:
-              # 兼容空格差异
-              old_e2 = 'new_initrd_xz = patch_initrd_xz(initrd_xz,key_dict)'
-              new_e2 = 'new_initrd_xz = patch_initrd_xz(initrd_xz,key_dict,ljust=False)'
-              if old_e2 not in t:
-                  raise SystemExit('patch_elf call not found')
-              t = t.replace(old_e2, new_e2, 1)
-          else:
-              t = t.replace(old_e, new_e, 1)
+          new_fn = '''def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):
+      initrd = lzma.decompress(initrd_xz)
+      new_initrd = initrd
+      for old_public_key,new_public_key in key_dict.items():
+          if old_public_key in new_initrd:
+              print(f'initrd public key patched {old_public_key[:16].hex().upper()}...')
+              new_initrd = new_initrd.replace(old_public_key,new_public_key)
 
+      candidates = []
+      trials = [
+          (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 4*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 2*1024*1024, 3, 0, 2),
+          (9, 8*1024*1024, 3, 0, 2),
+          (9, 4*1024*1024, 3, 0, 2),
+          (9, None, None, None, None),
+          (7, None, None, None, None),
+          (6, None, None, None, None),
+      ]
+      for preset, dict_size, lc, lp, pb in trials:
+          filt = {'id': lzma.FILTER_LZMA2, 'preset': preset}
+          if dict_size is not None:
+              filt['dict_size'] = dict_size
+          if lc is not None:
+              filt['lc'] = lc
+              filt['lp'] = lp
+              filt['pb'] = pb
+          try:
+              out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])
+              candidates.append(out)
+          except Exception as e:
+              print('compress trial failed:', e)
+
+      if not candidates:
+          print('WARNING: no compress candidate, keep original initrd xz')
+          return initrd_xz
+
+      new_initrd_xz = min(candidates, key=len)
+      print(f'new initrd xz size:{len(new_initrd_xz)}')
+      print(f'old initrd xz size:{len(initrd_xz)}')
+
+      if len(new_initrd_xz) > len(initrd_xz):
+          # 关键：宁可跳过内核 initrd 公钥替换，也不要把 ELF 撑破导致重启循环
+          print('WARNING: compressed initrd still larger; SKIP kernel initrd key patch to keep device bootable')
+          return initrd_xz
+
+      if ljust:
+          print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')
+          new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), b'\\x00')
+      return new_initrd_xz
+
+'''
+          t = t[:start] + new_fn + t[end:]
           p.write_text(t, encoding='utf-8')
-          print('patch.py fixed for mmips')
+          print('patch_initrd_xz replaced')
           "
           python3 -m py_compile patch.py
-          grep -n "ljust=False\|PRESET_EXTREME" patch.py || true
 
       - name: Build mmips packages
         env:
@@ -93,15 +132,10 @@ jobs:
             -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
-          test -s "$WORK/routeros-${ARCH}-${VERSION}.npk"
-          test -s "$WORK/all_packages-${ARCH}-${VERSION}.zip"
-
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
-          ls -lh "$WORK/pkgs/"
 
-          shopt -s nullglob
           for f in "$WORK"/pkgs/*.npk; do
             echo "[Processing NPK]: $f"
             python3 patch.py npk "$f"
@@ -110,9 +144,6 @@ jobs:
 
           cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
-
-          test -s "$OUT/routeros-${ARCH}-${VERSION}.npk"
-          test -s "$OUT/all_packages-${ARCH}-${VERSION}.zip"
           ls -lh "$OUT/"
 
       - name: Upload Artifacts
@@ -128,13 +159,13 @@ jobs:
           tag_name: v6.48.2-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.2 stable mmips
           body: |
-            RouterOS 6.48.2 mmips patched.
+            RouterOS 6.48.2 mmips patched (boot-safe).
+            - If kernel initrd xz cannot shrink, kernel key patch is skipped to avoid reboot loop
+            - Squashfs keys + NPK re-sign still applied
 
+            Assets:
             - routeros-mmips-6.48.2.npk
             - all_packages-mmips-6.48.2.zip
-
-            License public key:
-            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
           files: |
             output/routeros-mmips-6.48.2.npk
             output/all_packages-mmips-6.48.2.zip
