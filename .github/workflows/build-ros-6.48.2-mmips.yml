@@ -46,8 +46,9 @@ jobs:
               raise SystemExit("compress line not found")
           t = t.replace(old_c, new_c, 1)
 
+          # 单行替换，避免缩进错误；超长则直接 return 原 initrd，防止刷机重启循环
           old_a = "assert len(new_initrd_xz) <= len(initrd_xz),'new initrd xz size is too big'"
-          new_a = "if len(new_initrd_xz) > len(initrd_xz):\n        print('WARNING: skip initrd patch, size too big'); return initrd_xz"
+          new_a = "if len(new_initrd_xz) > len(initrd_xz): print('WARNING: skip initrd patch, size too big'); return initrd_xz"
           if old_a not in t:
               raise SystemExit("assert line not found")
           t = t.replace(old_a, new_a, 1)
@@ -86,10 +87,15 @@ jobs:
             -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
+          test -s "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          test -s "$WORK/all_packages-${ARCH}-${VERSION}.zip"
+
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
+          ls -lh "$WORK/pkgs/"
 
+          shopt -s nullglob
           for f in "$WORK"/pkgs/*.npk; do
             echo "[Processing NPK]: $f"
             python3 patch.py npk "$f"
@@ -98,6 +104,9 @@ jobs:
 
           cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
+
+          test -s "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          test -s "$OUT/all_packages-${ARCH}-${VERSION}.zip"
           ls -lh "$OUT/"
 
       - name: Upload Artifacts
@@ -114,12 +123,16 @@ jobs:
           name: RouterOS 6.48.2 stable mmips
           body: |
             RouterOS 6.48.2 mmips patched (boot-safe).
-            If kernel initrd cannot shrink, key patch in initrd is skipped to avoid reboot loop.
-            Squashfs keys + NPK re-sign still applied.
+
+            - If kernel initrd xz cannot shrink, initrd key patch is skipped to avoid reboot loop
+            - Squashfs keys + NPK re-sign still applied
 
             Assets:
             - routeros-mmips-6.48.2.npk
             - all_packages-mmips-6.48.2.zip
+
+            License public key:
+            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
           files: |
             output/routeros-mmips-6.48.2.npk
             output/all_packages-mmips-6.48.2.zip
