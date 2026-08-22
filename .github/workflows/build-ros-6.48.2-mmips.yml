@@ -32,22 +32,39 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py initrd compression
+      - name: Fix patch.py for mmips ELF initrd
         run: |
           set -euo pipefail
-          # 把 preset:9 改成更强压缩，尽量避免 new initrd xz size is too big
           python3 -c "
           from pathlib import Path
           p = Path('patch.py')
           t = p.read_text(encoding='utf-8')
-          old = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9,}] )'
-          new = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9 | lzma.PRESET_EXTREME, \"dict_size\": 32*1024*1024}] )'
-          if old not in t:
-              raise SystemExit('compress line not found in patch.py')
-          p.write_text(t.replace(old, new, 1), encoding='utf-8')
-          print('patch.py updated')
+
+          # 1) 更强压缩
+          old_c = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9,}] )'
+          new_c = 'lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{\"id\": lzma.FILTER_LZMA2, \"preset\": 9 | lzma.PRESET_EXTREME, \"dict_size\": 32*1024*1024}] )'
+          if old_c not in t:
+              raise SystemExit('compress line not found')
+          t = t.replace(old_c, new_c, 1)
+
+          # 2) ELF 路径不要强制 xz 等长（mmips 会触发 size too big）
+          old_e = 'new_initrd_xz =  patch_initrd_xz(initrd_xz,key_dict)'
+          new_e = 'new_initrd_xz =  patch_initrd_xz(initrd_xz,key_dict,ljust=False)'
+          if old_e not in t:
+              # 兼容空格差异
+              old_e2 = 'new_initrd_xz = patch_initrd_xz(initrd_xz,key_dict)'
+              new_e2 = 'new_initrd_xz = patch_initrd_xz(initrd_xz,key_dict,ljust=False)'
+              if old_e2 not in t:
+                  raise SystemExit('patch_elf call not found')
+              t = t.replace(old_e2, new_e2, 1)
+          else:
+              t = t.replace(old_e, new_e, 1)
+
+          p.write_text(t, encoding='utf-8')
+          print('patch.py fixed for mmips')
           "
           python3 -m py_compile patch.py
+          grep -n "ljust=False\|PRESET_EXTREME" patch.py || true
 
       - name: Build mmips packages
         env:
