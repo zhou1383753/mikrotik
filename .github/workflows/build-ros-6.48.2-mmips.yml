@@ -1,0 +1,139 @@
+name: Build and Release RouterOS 6.48.2 mmips
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate build environment
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Checking required files ==="
+          test -f patch.py
+          test -f npk.py
+
+          echo "=== Checking required secrets ==="
+          test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_NPK_SIGN_PRIVATE_KEY is not configured"; exit 1; }
+          test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_LICENSE_PRIVATE_KEY is not configured"; exit 1; }
+
+          echo "=== Checking Python syntax ==="
+          python3 -m py_compile patch.py npk.py
+
+      - name: Download, Patch & Build RouterOS 6.48.2 mmips
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+
+          VERSION="6.48.2"
+          ARCH="mmips"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/pkgs" "$OUT"
+
+          echo "=== 1. Download official mmips packages ==="
+          # 官方命名与 FUjr 发布一致: routeros-mmips-x.y.z.npk / all_packages-mmips-x.y.z.zip
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/routeros-${ARCH}-${VERSION}.npk" \
+            "https://download.mikrotik.com/routeros/${VERSION}/routeros-${ARCH}-${VERSION}.npk"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+
+          test -s "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          test -s "$WORK/all_packages-${ARCH}-${VERSION}.zip"
+
+          echo "=== 2. Extract all packages ==="
+          unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
+
+          # 主包也放进 pkgs，统一处理（避免重复可先覆盖）
+          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
+
+          echo "=== Package list ==="
+          ls -lh "$WORK/pkgs/"
+
+          echo "=== 3. Patch & re-sign all NPK files ==="
+          shopt -s nullglob
+          npk_files=("$WORK"/pkgs/*.npk)
+          test "${#npk_files[@]}" -gt 0
+
+          for f in "${npk_files[@]}"; do
+            echo "[Processing NPK]: $f"
+            python3 patch.py npk "$f"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          # 单独再保证主包输出文件是最新已 patch 的
+          if [ -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" ]; then
+            cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          fi
+
+          echo "=== 4. Package outputs ==="
+          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          (
+            cd "$WORK/pkgs"
+            zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk
+          )
+
+          echo "=== 5. Verify ==="
+          test -s "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          test -s "$OUT/all_packages-${ARCH}-${VERSION}.zip"
+          ls -lh "$OUT/"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-6.48.2-Patched-mmips
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.48.2-mmips-patched-${{ github.run_id }}
+          name: RouterOS 6.48.2 stable mmips
+          body: |
+            RouterOS 6.48.2 mmips patched release.
+
+            Assets:
+            - routeros-mmips-6.48.2.npk
+            - all_packages-mmips-6.48.2.zip
+
+            License public key (must match your private key):
+            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
+
+            Workflow run: ${{ github.run_id }}
+          files: |
+            output/routeros-mmips-6.48.2.npk
+            output/all_packages-mmips-6.48.2.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
