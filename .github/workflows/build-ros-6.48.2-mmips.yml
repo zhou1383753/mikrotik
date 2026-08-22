@@ -59,8 +59,46 @@ jobs:
           rm -rf "$WORK" "$OUT"
           mkdir -p "$WORK/pkgs" "$OUT"
 
+          echo "=== 0. Fix patch.py compression for mmips initrd (avoid 'xz size too big') ==="
+          # 原 patch_initrd_xz 使用 preset=9，mmips 上重压缩后可能变大
+          # 改为 PRESET_EXTREME + 更大字典，尽量压回原尺寸
+          python3 << 'PY'
+          from pathlib import Path
+          path = Path("patch.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''new_initrd_xz = lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{"id": lzma.FILTER_LZMA2, "preset": 9,}] )'''
+          new = '''new_initrd_xz = lzma.compress(
+        new_initrd,
+        check=lzma.CHECK_CRC32,
+        filters=[{
+            "id": lzma.FILTER_LZMA2,
+            "preset": 9 | lzma.PRESET_EXTREME,
+            "dict_size": 32 * 1024 * 1024,
+            "lc": 3,
+            "lp": 0,
+            "pb": 2,
+        }],
+    )'''
+          if old not in text:
+              # 兼容可能的空格差异，用更宽松替换
+              import re
+              text2, n = re.subn(
+                  r'new_initrd_xz\s*=\s*lzma\.compress\(\s*new_initrd\s*,\s*check=lzma\.CHECK_CRC32\s*,\s*filters=\[\s*\{\s*"id":\s*lzma\.FILTER_LZMA2\s*,\s*"preset":\s*9\s*,?\s*\}\s*\]\s*\)',
+                  new,
+                  text,
+                  count=1,
+              )
+              if n != 1:
+                  raise SystemExit("ERROR: could not locate patch_initrd_xz compress line in patch.py")
+              text = text2
+          else:
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+          print("patch.py compression settings updated")
+          PY
+          python3 -m py_compile patch.py
+
           echo "=== 1. Download official mmips packages ==="
-          # 官方命名与 FUjr 发布一致: routeros-mmips-x.y.z.npk / all_packages-mmips-x.y.z.zip
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
             -O "$WORK/routeros-${ARCH}-${VERSION}.npk" \
             "https://download.mikrotik.com/routeros/${VERSION}/routeros-${ARCH}-${VERSION}.npk"
@@ -74,8 +112,6 @@ jobs:
           echo "=== 2. Extract all packages ==="
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
-
-          # 主包也放进 pkgs，统一处理（避免重复可先覆盖）
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
 
           echo "=== Package list ==="
@@ -92,7 +128,6 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          # 单独再保证主包输出文件是最新已 patch 的
           if [ -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" ]; then
             cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           fi
