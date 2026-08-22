@@ -26,17 +26,81 @@ jobs:
           CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-
-          echo "=== Checking required files ==="
           test -f patch.py
           test -f npk.py
-
-          echo "=== Checking required secrets ==="
-          test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_NPK_SIGN_PRIVATE_KEY is not configured"; exit 1; }
-          test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_LICENSE_PRIVATE_KEY is not configured"; exit 1; }
-
-          echo "=== Checking Python syntax ==="
+          test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: missing CUSTOM_NPK_SIGN_PRIVATE_KEY"; exit 1; }
+          test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: missing CUSTOM_LICENSE_PRIVATE_KEY"; exit 1; }
           python3 -m py_compile patch.py npk.py
+
+      - name: Fix patch.py for mmips initrd size
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("patch.py")
+          text = path.read_text(encoding="utf-8")
+
+          start = text.find("def patch_initrd_xz(")
+          if start < 0:
+              raise SystemExit("ERROR: def patch_initrd_xz not found")
+          end = text.find("\ndef find_7zXZ_data(", start)
+          if end < 0:
+              raise SystemExit("ERROR: find_7zXZ_data not found after patch_initrd_xz")
+
+          new_fn = '''def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):
+      initrd = lzma.decompress(initrd_xz)
+      new_initrd = initrd
+      for old_public_key,new_public_key in key_dict.items():
+          if old_public_key in new_initrd:
+              print(f'initrd public key patched {old_public_key[:16].hex().upper()}...')
+              new_initrd = new_initrd.replace(old_public_key,new_public_key)
+
+      candidates = []
+      # try several compress settings; pick the smallest result
+      for preset, dict_size, lc, lp, pb in [
+          (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),
+          (9 | lzma.PRESET_EXTREME, 4*1024*1024, 3, 0, 2),
+          (9, 8*1024*1024, 3, 0, 2),
+          (9, None, None, None, None),
+      ]:
+          filters = [{"id": lzma.FILTER_LZMA2, "preset": preset}]
+          if dict_size is not None:
+              filters[0]["dict_size"] = dict_size
+          if lc is not None:
+              filters[0]["lc"] = lc
+              filters[0]["lp"] = lp
+              filters[0]["pb"] = pb
+          try:
+              out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=filters)
+              candidates.append(out)
+          except Exception as e:
+              print(f"compress candidate failed: {e}")
+
+      if not candidates:
+          raise RuntimeError("all compress candidates failed")
+
+      new_initrd_xz = min(candidates, key=len)
+      print(f'new initrd xz size:{len(new_initrd_xz)}')
+      print(f'old initrd xz size:{len(initrd_xz)}')
+
+      if ljust:
+          if len(new_initrd_xz) > len(initrd_xz):
+              raise AssertionError(
+                  f"new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}"
+              )
+          print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')
+          new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), b'\\0')
+      return new_initrd_xz
+
+'''
+          text = text[:start] + new_fn + text[end:]
+          path.write_text(text, encoding="utf-8")
+          print("patch_initrd_xz replaced OK")
+          PY
+          python3 -m py_compile patch.py
+          echo "patch.py ready"
 
       - name: Download, Patch & Build RouterOS 6.48.2 mmips
         env:
@@ -59,45 +123,6 @@ jobs:
           rm -rf "$WORK" "$OUT"
           mkdir -p "$WORK/pkgs" "$OUT"
 
-          echo "=== 0. Fix patch.py compression for mmips initrd (avoid 'xz size too big') ==="
-          # 原 patch_initrd_xz 使用 preset=9，mmips 上重压缩后可能变大
-          # 改为 PRESET_EXTREME + 更大字典，尽量压回原尺寸
-          python3 << 'PY'
-          from pathlib import Path
-          path = Path("patch.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''new_initrd_xz = lzma.compress(new_initrd,check=lzma.CHECK_CRC32,filters=[{"id": lzma.FILTER_LZMA2, "preset": 9,}] )'''
-          new = '''new_initrd_xz = lzma.compress(
-        new_initrd,
-        check=lzma.CHECK_CRC32,
-        filters=[{
-            "id": lzma.FILTER_LZMA2,
-            "preset": 9 | lzma.PRESET_EXTREME,
-            "dict_size": 32 * 1024 * 1024,
-            "lc": 3,
-            "lp": 0,
-            "pb": 2,
-        }],
-    )'''
-          if old not in text:
-              # 兼容可能的空格差异，用更宽松替换
-              import re
-              text2, n = re.subn(
-                  r'new_initrd_xz\s*=\s*lzma\.compress\(\s*new_initrd\s*,\s*check=lzma\.CHECK_CRC32\s*,\s*filters=\[\s*\{\s*"id":\s*lzma\.FILTER_LZMA2\s*,\s*"preset":\s*9\s*,?\s*\}\s*\]\s*\)',
-                  new,
-                  text,
-                  count=1,
-              )
-              if n != 1:
-                  raise SystemExit("ERROR: could not locate patch_initrd_xz compress line in patch.py")
-              text = text2
-          else:
-              text = text.replace(old, new, 1)
-          path.write_text(text, encoding="utf-8")
-          print("patch.py compression settings updated")
-          PY
-          python3 -m py_compile patch.py
-
           echo "=== 1. Download official mmips packages ==="
           wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
             -O "$WORK/routeros-${ARCH}-${VERSION}.npk" \
@@ -113,8 +138,6 @@ jobs:
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
-
-          echo "=== Package list ==="
           ls -lh "$WORK/pkgs/"
 
           echo "=== 3. Patch & re-sign all NPK files ==="
@@ -128,16 +151,11 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          if [ -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" ]; then
-            cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
-          fi
+          cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
 
           echo "=== 4. Package outputs ==="
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
-          (
-            cd "$WORK/pkgs"
-            zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk
-          )
+          (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
 
           echo "=== 5. Verify ==="
           test -s "$OUT/routeros-${ARCH}-${VERSION}.npk"
@@ -163,7 +181,7 @@ jobs:
             - routeros-mmips-6.48.2.npk
             - all_packages-mmips-6.48.2.zip
 
-            License public key (must match your private key):
+            License public key:
             52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
 
             Workflow run: ${{ github.run_id }}
