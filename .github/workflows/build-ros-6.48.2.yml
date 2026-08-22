@@ -79,8 +79,10 @@ jobs:
           sudo mount -o loop,ro "$WORK/mikrotik-${VERSION}.iso" "$WORK/iso"
           sudo cp -a "$WORK/iso/." "$WORK/new_iso/"
           sudo umount "$WORK/iso"
-          # 放开写权限（从 ISO 拷出来的文件可能是只读）
-          sudo chmod -R u+w "$WORK/new_iso"
+
+          # 关键：属主改回当前用户，否则无法覆盖 system-*.npk 等
+          sudo chown -R "$(id -u):$(id -g)" "$WORK/new_iso"
+          chmod -R u+w "$WORK/new_iso"
 
           echo "=== ISO layout ==="
           ls -la "$WORK/new_iso/"
@@ -88,11 +90,10 @@ jobs:
 
           echo "=== 4. Extract packages + patch/sign ==="
           unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/pkgs/"
-          # ISO 里的 npk 也拷一份（以 zip 为主，缺的再补）
           cp -n "$WORK/new_iso/"*.npk "$WORK/pkgs/" 2>/dev/null || true
           chmod -R u+w "$WORK/pkgs"
 
-          # v6 主包名是 system-*.npk（不是 routeros-*.npk）
+          # v6 主包名是 system-*.npk
           if [ -f "$WORK/new_iso/system-${VERSION}.npk" ]; then
             cp -f "$WORK/new_iso/system-${VERSION}.npk" "$WORK/pkgs/"
           fi
@@ -107,11 +108,9 @@ jobs:
             python3 npk.py sign "$f" "$f"
           done
 
-          # 把已 patch 的 system 包放回 ISO 目录（若存在）
           if [ -f "$WORK/pkgs/system-${VERSION}.npk" ]; then
             cp -f "$WORK/pkgs/system-${VERSION}.npk" "$WORK/new_iso/system-${VERSION}.npk"
           fi
-          # 同步其它已签名 npk 回 new_iso（同名覆盖）
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
             if [ -f "$WORK/new_iso/$base" ]; then
@@ -120,26 +119,30 @@ jobs:
           done
 
           echo "=== 5. Patch v6 kernel/initrd (isolinux/initrd.rgz) ==="
-          # v6 公钥在 isolinux/initrd.rgz 里，不是 efiboot 的 linux.x86_64
           if [ ! -f "$WORK/new_iso/isolinux/initrd.rgz" ]; then
             echo "ERROR: isolinux/initrd.rgz not found"
             find "$WORK/new_iso" -type f | head -80
             exit 1
           fi
 
-          sudo -E python3 patch.py kernel "$WORK/new_iso/isolinux/initrd.rgz"
+          python3 patch.py kernel "$WORK/new_iso/isolinux/initrd.rgz"
           echo "[initrd.rgz patched OK]"
 
-          # 保留引导文件，供 install-image 使用
-          test -f "$WORK/new_iso/isolinux/linux" || test -f "$WORK/new_iso/isolinux/LINUX"
-          cp -f "$WORK/new_iso/isolinux/linux" "$WORK/linux" 2>/dev/null || cp -f "$WORK/new_iso/isolinux/LINUX" "$WORK/linux"
+          if [ -f "$WORK/new_iso/isolinux/linux" ]; then
+            cp -f "$WORK/new_iso/isolinux/linux" "$WORK/linux"
+          elif [ -f "$WORK/new_iso/isolinux/LINUX" ]; then
+            cp -f "$WORK/new_iso/isolinux/LINUX" "$WORK/linux"
+          else
+            echo "ERROR: isolinux/linux not found"
+            ls -la "$WORK/new_iso/isolinux/"
+            exit 1
+          fi
           cp -f "$WORK/new_iso/isolinux/initrd.rgz" "$WORK/initrd.rgz"
           test -s "$WORK/linux"
           test -s "$WORK/initrd.rgz"
 
           echo "=== 6. Create install-image (v6 style) ==="
           IMG="$WORK/install-image-${VERSION}.img"
-          # v6 官方流程常用约 64M；包多时可加大
           truncate --size 128M "$IMG"
           mkfs.vfat -I -F 32 -n "Install" "$IMG"
 
@@ -149,7 +152,6 @@ jobs:
 
           sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$LOOP" "$WORK/install"
 
-          # v6 需要 linux + initrd.rgz
           cp -vf "$WORK/linux" "$WORK/install/linux"
           cp -vf "$WORK/initrd.rgz" "$WORK/install/initrd.rgz"
           cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 "$WORK/install/" 2>/dev/null || true
@@ -206,8 +208,8 @@ jobs:
           tag_name: v6.48.2-patched-${{ github.run_id }}
           name: RouterOS 6.48.2 Patched Release (x86)
           body: |
-            RouterOS 6.x build (different from v7):
-            - Patch isolinux/initrd.rgz (not efiboot linux.x86_64)
+            RouterOS 6.x build:
+            - Patch isolinux/initrd.rgz
             - Main package: system-*.npk
             - install-image includes linux + initrd.rgz
             - Packages embedded as 1.npk, 2.npk, ...
