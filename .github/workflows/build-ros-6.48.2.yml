@@ -1,0 +1,227 @@
+name: Build and Release RouterOS 6.48.2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate build environment
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Checking required files ==="
+          test -f patch.py
+          test -f npk.py
+
+          echo "=== Checking required secrets ==="
+          test -n "$CUSTOM_NPK_SIGN_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_NPK_SIGN_PRIVATE_KEY is not configured"; exit 1; }
+          test -n "$CUSTOM_LICENSE_PRIVATE_KEY" || { echo "ERROR: GitHub Secret CUSTOM_LICENSE_PRIVATE_KEY is not configured"; exit 1; }
+
+          echo "=== Checking Python syntax ==="
+          python3 -m py_compile patch.py npk.py
+
+      - name: Download, Patch & Build RouterOS 6.48.2 (v6 style)
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+
+          VERSION="6.48.2"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK"/{iso,new_iso,install,pkgs} "$OUT"
+
+          echo "=== 1. Install dependencies ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            dosfstools syslinux isolinux syslinux-common \
+            genisoimage xorriso wget unzip qemu-utils
+
+          echo "=== 2. Download official sources (v6) ==="
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/mikrotik-${VERSION}.iso" \
+            "https://download.mikrotik.com/routeros/${VERSION}/mikrotik-${VERSION}.iso"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-x86-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-x86-${VERSION}.zip"
+
+          test -s "$WORK/mikrotik-${VERSION}.iso"
+          test -s "$WORK/all_packages-x86-${VERSION}.zip"
+
+          echo "=== 3. Unpack ISO ==="
+          sudo mount -o loop,ro "$WORK/mikrotik-${VERSION}.iso" "$WORK/iso"
+          sudo cp -a "$WORK/iso/." "$WORK/new_iso/"
+          sudo umount "$WORK/iso"
+          # 放开写权限（从 ISO 拷出来的文件可能是只读）
+          sudo chmod -R u+w "$WORK/new_iso"
+
+          echo "=== ISO layout ==="
+          ls -la "$WORK/new_iso/"
+          ls -la "$WORK/new_iso/isolinux/" || true
+
+          echo "=== 4. Extract packages + patch/sign ==="
+          unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/pkgs/"
+          # ISO 里的 npk 也拷一份（以 zip 为主，缺的再补）
+          cp -n "$WORK/new_iso/"*.npk "$WORK/pkgs/" 2>/dev/null || true
+          chmod -R u+w "$WORK/pkgs"
+
+          # v6 主包名是 system-*.npk（不是 routeros-*.npk）
+          if [ -f "$WORK/new_iso/system-${VERSION}.npk" ]; then
+            cp -f "$WORK/new_iso/system-${VERSION}.npk" "$WORK/pkgs/"
+          fi
+
+          shopt -s nullglob
+          npk_files=("$WORK"/pkgs/*.npk)
+          test "${#npk_files[@]}" -gt 0
+
+          for f in "${npk_files[@]}"; do
+            echo "[Processing NPK]: $f"
+            python3 patch.py npk "$f"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          # 把已 patch 的 system 包放回 ISO 目录（若存在）
+          if [ -f "$WORK/pkgs/system-${VERSION}.npk" ]; then
+            cp -f "$WORK/pkgs/system-${VERSION}.npk" "$WORK/new_iso/system-${VERSION}.npk"
+          fi
+          # 同步其它已签名 npk 回 new_iso（同名覆盖）
+          for f in "$WORK"/pkgs/*.npk; do
+            base=$(basename "$f")
+            if [ -f "$WORK/new_iso/$base" ]; then
+              cp -f "$f" "$WORK/new_iso/$base"
+            fi
+          done
+
+          echo "=== 5. Patch v6 kernel/initrd (isolinux/initrd.rgz) ==="
+          # v6 公钥在 isolinux/initrd.rgz 里，不是 efiboot 的 linux.x86_64
+          if [ ! -f "$WORK/new_iso/isolinux/initrd.rgz" ]; then
+            echo "ERROR: isolinux/initrd.rgz not found"
+            find "$WORK/new_iso" -type f | head -80
+            exit 1
+          fi
+
+          sudo -E python3 patch.py kernel "$WORK/new_iso/isolinux/initrd.rgz"
+          echo "[initrd.rgz patched OK]"
+
+          # 保留引导文件，供 install-image 使用
+          test -f "$WORK/new_iso/isolinux/linux" || test -f "$WORK/new_iso/isolinux/LINUX"
+          cp -f "$WORK/new_iso/isolinux/linux" "$WORK/linux" 2>/dev/null || cp -f "$WORK/new_iso/isolinux/LINUX" "$WORK/linux"
+          cp -f "$WORK/new_iso/isolinux/initrd.rgz" "$WORK/initrd.rgz"
+          test -s "$WORK/linux"
+          test -s "$WORK/initrd.rgz"
+
+          echo "=== 6. Create install-image (v6 style) ==="
+          IMG="$WORK/install-image-${VERSION}.img"
+          # v6 官方流程常用约 64M；包多时可加大
+          truncate --size 128M "$IMG"
+          mkfs.vfat -I -F 32 -n "Install" "$IMG"
+
+          LOOP=$(sudo losetup -f --show "$IMG")
+          echo "Loop device: $LOOP"
+          sudo syslinux --install "$LOOP"
+
+          sudo mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$LOOP" "$WORK/install"
+
+          # v6 需要 linux + initrd.rgz
+          cp -vf "$WORK/linux" "$WORK/install/linux"
+          cp -vf "$WORK/initrd.rgz" "$WORK/install/initrd.rgz"
+          cp -vf /usr/lib/syslinux/modules/bios/ldlinux.c32 "$WORK/install/" 2>/dev/null || true
+
+          cat > "$WORK/install/syslinux.cfg" << 'EOF'
+          default system
+          LABEL system
+            KERNEL linux
+            APPEND load_ramdisk=1 initrd=initrd.rgz -hdd-install
+          EOF
+
+          i=1
+          for f in "$WORK"/pkgs/*.npk; do
+            echo "$f => ${i}.npk"
+            cp -vf "$f" "$WORK/install/${i}.npk"
+            i=$((i + 1))
+          done
+
+          touch "$WORK/install/CHOOSE"
+          touch "$WORK/install/autorun.scr"
+
+          echo "=== install-image content ==="
+          ls -la "$WORK/install/"
+
+          sync
+          sudo umount "$WORK/install"
+          sudo losetup -d "$LOOP"
+
+          echo "=== 7. Package outputs ==="
+          (
+            cd "$WORK/pkgs"
+            zip -r "$OUT/all_packages-x86-${VERSION}.zip" ./*.npk
+          )
+          (
+            cd "$WORK"
+            zip -j "$OUT/install-image-${VERSION}.zip" "install-image-${VERSION}.img"
+          )
+
+          echo "=== 8. Verify ==="
+          test -s "$OUT/install-image-${VERSION}.zip"
+          test -s "$OUT/all_packages-x86-${VERSION}.zip"
+          ls -lh "$OUT/"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-6.48.2-Patched-x86
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.48.2-patched-${{ github.run_id }}
+          name: RouterOS 6.48.2 Patched Release (x86)
+          body: |
+            RouterOS 6.x build (different from v7):
+            - Patch isolinux/initrd.rgz (not efiboot linux.x86_64)
+            - Main package: system-*.npk
+            - install-image includes linux + initrd.rgz
+            - Packages embedded as 1.npk, 2.npk, ...
+
+            Outputs:
+            - install-image-6.48.2.zip
+            - all_packages-x86-6.48.2.zip
+
+            License public key (must match your private key):
+            52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462
+
+            Workflow run: ${{ github.run_id }}
+          files: |
+            output/install-image-6.48.2.zip
+            output/all_packages-x86-6.48.2.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
