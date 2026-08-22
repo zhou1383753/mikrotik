@@ -32,110 +32,10 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py (multi compress, NEVER skip if still too big)
+      - name: Fix patch.py for mmips initrd
         run: |
           set -euo pipefail
-          cat > /tmp/fix_patch.py << 'EOF'
-          from pathlib import Path
-          import re
-
-          p = Path("patch.py")
-          t = p.read_text(encoding="utf-8")
-
-          start = t.find("def patch_initrd_xz(")
-          end = t.find("\ndef find_7zXZ_data(", start)
-          if start < 0 or end < 0:
-              raise SystemExit("patch_initrd_xz not found")
-
-          new_fn = r'''def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):
-      import subprocess, tempfile, os
-      initrd = lzma.decompress(initrd_xz)
-      new_initrd = initrd
-      for old_public_key,new_public_key in key_dict.items():
-          if old_public_key in new_initrd:
-              print(f'initrd public key patched {old_public_key[:16].hex().upper()}...')
-              new_initrd = new_initrd.replace(old_public_key,new_public_key)
-
-      candidates = []
-
-      # Python lzma trials
-      trials = [
-          (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),
-          (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),
-          (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),
-          (9 | lzma.PRESET_EXTREME, 4*1024*1024, 3, 0, 2),
-          (9 | lzma.PRESET_EXTREME, 2*1024*1024, 3, 0, 2),
-          (9 | lzma.PRESET_EXTREME, 1*1024*1024, 3, 0, 2),
-          (9, 8*1024*1024, 3, 0, 2),
-          (9, 4*1024*1024, 3, 0, 2),
-          (9, None, None, None, None),
-          (7, None, None, None, None),
-          (6, None, None, None, None),
-          (5, None, None, None, None),
-      ]
-      for preset, dict_size, lc, lp, pb in trials:
-          filt = {"id": lzma.FILTER_LZMA2, "preset": preset}
-          if dict_size is not None:
-              filt["dict_size"] = dict_size
-          if lc is not None:
-              filt["lc"] = lc
-              filt["lp"] = lp
-              filt["pb"] = pb
-          try:
-              out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])
-              candidates.append(out)
-          except Exception as e:
-              print("py lzma trial failed:", e)
-
-      # system xz trials (often smaller than Python lzma)
-      try:
-          with tempfile.TemporaryDirectory() as td:
-              raw = os.path.join(td, "in.bin")
-              open(raw, "wb").write(new_initrd)
-              for extra in [
-                  ["-C", "crc32", "-F", "xz", "-9e", "--lzma2=dict=32MiB"],
-                  ["-C", "crc32", "-F", "xz", "-9e", "--lzma2=dict=16MiB"],
-                  ["-C", "crc32", "-F", "xz", "-9e", "--lzma2=dict=8MiB"],
-                  ["-C", "crc32", "-F", "xz", "-9e"],
-                  ["-C", "crc32", "-F", "xz", "-9"],
-                  ["-C", "crc32", "-F", "xz", "-7"],
-              ]:
-                  outp = os.path.join(td, "out.xz")
-                  if os.path.exists(outp):
-                      os.remove(outp)
-                  cmd = ["xz", "-k", "-f", "-c"] + extra + [raw]
-                  try:
-                      data = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-                      candidates.append(data)
-                  except Exception as e:
-                      print("xz trial failed:", extra, e)
-      except Exception as e:
-          print("xz tool path failed:", e)
-
-      if not candidates:
-          raise RuntimeError("no compress candidates")
-
-      new_initrd_xz = min(candidates, key=len)
-      print(f"new initrd xz size:{len(new_initrd_xz)}")
-      print(f"old initrd xz size:{len(initrd_xz)}")
-
-      if len(new_initrd_xz) > len(initrd_xz):
-          # 禁止 skip：否则自定义签名 + 原厂验签公钥 = 重启循环
-          raise AssertionError(
-              f"new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}. "
-              f"Refusing to build boot-breaking package."
-          )
-
-      if ljust:
-          print(f"ljust size:{len(initrd_xz)-len(new_initrd_xz)}")
-          new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), b"\0")
-      return new_initrd_xz
-
-'''
-          t = t[:start] + new_fn + t[end:]
-          p.write_text(t, encoding="utf-8")
-          print("patch_initrd_xz replaced OK")
-          EOF
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCnAgPSBQYXRoKCJwYXRjaC5weSIpCnQgPSBwLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQpzdGFydCA9IHQuZmluZCgiZGVmIHBhdGNoX2luaXRyZF94eigiKQplbmQgPSB0LmZpbmQoIlxuZGVmIGZpbmRfN3pYWl9kYXRhKCIsIHN0YXJ0KQppZiBzdGFydCA8IDAgb3IgZW5kIDwgMDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoInBhdGNoX2luaXRyZF94eiBub3QgZm91bmQiKQpuZXdfZm4gPSAiIiJkZWYgcGF0Y2hfaW5pdHJkX3h6KGluaXRyZF94ejpieXRlcyxrZXlfZGljdDpkaWN0LGxqdXN0PVRydWUpOgogICAgaW1wb3J0IHN1YnByb2Nlc3MsIHRlbXBmaWxlLCBvcwogICAgaW5pdHJkID0gbHptYS5kZWNvbXByZXNzKGluaXRyZF94eikKICAgIG5ld19pbml0cmQgPSBpbml0cmQKICAgIGZvciBvbGRfcHVibGljX2tleSxuZXdfcHVibGljX2tleSBpbiBrZXlfZGljdC5pdGVtcygpOgogICAgICAgIGlmIG9sZF9wdWJsaWNfa2V5IGluIG5ld19pbml0cmQ6CiAgICAgICAgICAgIHByaW50KGYnaW5pdHJkIHB1YmxpYyBrZXkgcGF0Y2hlZCB7b2xkX3B1YmxpY19rZXlbOjE2XS5oZXgoKS51cHBlcigpfS4uLicpCiAgICAgICAgICAgIG5ld19pbml0cmQgPSBuZXdfaW5pdHJkLnJlcGxhY2Uob2xkX3B1YmxpY19rZXksbmV3X3B1YmxpY19rZXkpCiAgICBjYW5kaWRhdGVzID0gW10KICAgIHRyaWFscyA9IFsKICAgICAgICAoOSB8IGx6bWEuUFJFU0VUX0VYVFJFTUUsIDMyKjEwMjQqMTAyNCwgMywgMCwgMiksCiAgICAgICAgKDkgfCBsem1hLlBSRVNFVF9FWFRSRU1FLCAxNioxMDI0KjEwMjQsIDMsIDAsIDIpLAogICAgICAgICg5IHwgbHptYS5QUkVTRVRfRVhUUkVNRSwgOCoxMDI0KjEwMjQsIDMsIDAsIDIpLAogICAgICAgICg5IHwgbHptYS5QUkVTRVRfRVhUUkVNRSwgNCoxMDI0KjEwMjQsIDMsIDAsIDIpLAogICAgICAgICg5IHwgbHptYS5QUkVTRVRfRVhUUkVNRSwgMioxMDI0KjEwMjQsIDMsIDAsIDIpLAogICAgICAgICg5IHwgbHptYS5QUkVTRVRfRVhUUkVNRSwgMSoxMDI0KjEwMjQsIDMsIDAsIDIpLAogICAgICAgICg5LCA4KjEwMjQqMTAyNCwgMywgMCwgMiksCiAgICAgICAgKDksIDQqMTAyNCoxMDI0LCAzLCAwLCAyKSwKICAgICAgICAoOSwgTm9uZSwgTm9uZSwgTm9uZSwgTm9uZSksCiAgICAgICAgKDcsIE5vbmUsIE5vbmUsIE5vbmUsIE5vbmUpLAogICAgICAgICg2LCBOb25lLCBOb25lLCBOb25lLCBOb25lKSwKICAgICAgICAoNSwgTm9uZSwgTm9uZSwgTm9uZSwgTm9uZSksCiAgICBdCiAgICBmb3IgcHJlc2V0LCBkaWN0X3NpemUsIGxjLCBscCwgcGIgaW4gdHJpYWxzOgogICAgICAgIGZpbHQgPSB7ImlkIjogbHptYS5GSUxURVJfTFpNQTIsICJwcmVzZXQiOiBwcmVzZXR9CiAgICAgICAgaWYgZGljdF9zaXplIGlzIG5vdCBOb25lOgogICAgICAgICAgICBmaWx0WyJkaWN0X3NpemUiXSA9IGRpY3Rfc2l6ZQogICAgICAgIGlmIGxjIGlzIG5vdCBOb25lOgogICAgICAgICAgICBmaWx0WyJsYyJdID0gbGMKICAgICAgICAgICAgZmlsdFsibHAiXSA9IGxwCiAgICAgICAgICAgIGZpbHRbInBiIl0gPSBwYgogICAgICAgIHRyeToKICAgICAgICAgICAgb3V0ID0gbHptYS5jb21wcmVzcyhuZXdfaW5pdHJkLCBjaGVjaz1sem1hLkNIRUNLX0NSQzMyLCBmaWx0ZXJzPVtmaWx0XSkKICAgICAgICAgICAgY2FuZGlkYXRlcy5hcHBlbmQob3V0KQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoInB5IGx6bWEgdHJpYWwgZmFpbGVkOiIsIGUpCiAgICB0cnk6CiAgICAgICAgd2l0aCB0ZW1wZmlsZS5UZW1wb3JhcnlEaXJlY3RvcnkoKSBhcyB0ZDoKICAgICAgICAgICAgcmF3ID0gb3MucGF0aC5qb2luKHRkLCAiaW4uYmluIikKICAgICAgICAgICAgb3BlbihyYXcsICJ3YiIpLndyaXRlKG5ld19pbml0cmQpCiAgICAgICAgICAgIGZvciBleHRyYSBpbiBbCiAgICAgICAgICAgICAgICBbIi1DIiwgImNyYzMyIiwgIi1GIiwgInh6IiwgIi05ZSIsICItLWx6bWEyPWRpY3Q9MzJNaUIiXSwKICAgICAgICAgICAgICAgIFsiLUMiLCAiY3JjMzIiLCAiLUYiLCAieHoiLCAiLTllIiwgIi0tbHptYTI9ZGljdD0xNk1pQiJdLAogICAgICAgICAgICAgICAgWyItQyIsICJjcmMzMiIsICItRiIsICJ4eiIsICItOWUiLCAiLS1sem1hMj1kaWN0PThNaUIiXSwKICAgICAgICAgICAgICAgIFsiLUMiLCAiY3JjMzIiLCAiLUYiLCAieHoiLCAiLTllIl0sCiAgICAgICAgICAgICAgICBbIi1DIiwgImNyYzMyIiwgIi1GIiwgInh6IiwgIi05Il0sCiAgICAgICAgICAgICAgICBbIi1DIiwgImNyYzMyIiwgIi1GIiwgInh6IiwgIi03Il0sCiAgICAgICAgICAgIF06CiAgICAgICAgICAgICAgICBjbWQgPSBbInh6IiwgIi1rIiwgIi1mIiwgIi1jIl0gKyBleHRyYSArIFtyYXddCiAgICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgZGF0YSA9IHN1YnByb2Nlc3MuY2hlY2tfb3V0cHV0KGNtZCwgc3RkZXJyPXN1YnByb2Nlc3MuREVWTlVMTCkKICAgICAgICAgICAgICAgICAgICBjYW5kaWRhdGVzLmFwcGVuZChkYXRhKQogICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgICAgIHByaW50KCJ4eiB0cmlhbCBmYWlsZWQ6IiwgZXh0cmEsIGUpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcHJpbnQoInh6IHRvb2wgcGF0aCBmYWlsZWQ6IiwgZSkKICAgIGlmIG5vdCBjYW5kaWRhdGVzOgogICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigibm8gY29tcHJlc3MgY2FuZGlkYXRlcyIpCiAgICBuZXdfaW5pdHJkX3h6ID0gbWluKGNhbmRpZGF0ZXMsIGtleT1sZW4pCiAgICBwcmludChmIm5ldyBpbml0cmQgeHogc2l6ZTp7bGVuKG5ld19pbml0cmRfeHopfSIpCiAgICBwcmludChmIm9sZCBpbml0cmQgeHogc2l6ZTp7bGVuKGluaXRyZF94eil9IikKICAgIGlmIGxlbihuZXdfaW5pdHJkX3h6KSA+IGxlbihpbml0cmRfeHopOgogICAgICAgIHJhaXNlIEFzc2VydGlvbkVycm9yKAogICAgICAgICAgICBmIm5ldyBpbml0cmQgeHogc2l6ZSBpcyB0b28gYmlnOiBuZXc9e2xlbihuZXdfaW5pdHJkX3h6KX0gb2xkPXtsZW4oaW5pdHJkX3h6KX0uIFJlZnVzaW5nIHRvIGJ1aWxkIGJvb3QtYnJlYWtpbmcgcGFja2FnZS4iCiAgICAgICAgKQogICAgaWYgbGp1c3Q6CiAgICAgICAgcHJpbnQoZiJsanVzdCBzaXplOntsZW4oaW5pdHJkX3h6KS1sZW4obmV3X2luaXRyZF94eil9IikKICAgICAgICBuZXdfaW5pdHJkX3h6ID0gbmV3X2luaXRyZF94ei5sanVzdChsZW4oaW5pdHJkX3h6KSwgYiJceDAwIikKICAgIHJldHVybiBuZXdfaW5pdHJkX3h6CgoiIiIKdCA9IHRbOnN0YXJ0XSArIG5ld19mbiArIHRbZW5kOl0KcC53cml0ZV90ZXh0KHQsIGVuY29kaW5nPSJ1dGYtOCIpCnByaW50KCJwYXRjaF9pbml0cmRfeHogcmVwbGFjZWQgT0siKQo=' | base64 -d > /tmp/fix_patch.py
           python3 /tmp/fix_patch.py
           python3 -m py_compile patch.py
 
@@ -197,11 +97,7 @@ jobs:
           name: RouterOS 6.48.2 stable mmips
           body: |
             RouterOS 6.48.2 mmips patched.
-            Kernel initrd public keys MUST be replaced (build fails if xz cannot fit).
-
-            Assets:
-            - routeros-mmips-6.48.2.npk
-            - all_packages-mmips-6.48.2.zip
+            Build fails if kernel initrd xz cannot fit (avoids reboot loop packages).
           files: |
             output/routeros-mmips-6.48.2.npk
             output/all_packages-mmips-6.48.2.zip
