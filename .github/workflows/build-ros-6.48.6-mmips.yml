@@ -129,7 +129,6 @@ jobs:
             -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
-          # 保留原始完整 routeros（约 10MB）供注入
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk.orig"
           echo "Original routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk.orig") bytes"
 
@@ -137,7 +136,6 @@ jobs:
           chmod -R u+w "$WORK/pkgs"
           ls -lh "$WORK/pkgs/"
 
-          # 1) patch all_packages 里每个包（含 system）；跳过单独的 routeros 文件若存在
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
             if [[ "$base" == routeros-* ]]; then
@@ -157,7 +155,6 @@ jobs:
           fi
           echo "Patched system size: $(stat -c%s "$SYSTEM_NPK") bytes"
 
-          # 2) 把已 patch 的 system 注入到完整 routeros 多包中，再整体签名
           python3 << 'PY'
           import os
           from pathlib import Path
@@ -170,21 +167,37 @@ jobs:
           ros_orig = work / f"routeros-{arch}-{version}.npk.orig"
           ros_out = work / f"routeros-{arch}-{version}.npk"
 
+          print("system_path exists:", system_path.exists(), system_path)
+          print("ros_orig exists:", ros_orig.exists(), ros_orig)
+          if not system_path.exists() or not ros_orig.exists():
+              raise SystemExit("missing system or routeros.orig")
+
           sys_npk = NovaPackage.load(str(system_path))
           ros_npk = NovaPackage.load(str(ros_orig))
 
-          print(f"system is multi-package: {len(sys_npk._packages) > 0}")
-          print(f"routeros subpackages: {len(ros_npk._packages)}")
-          assert len(sys_npk._packages) == 0, "expected single system package"
-          assert len(ros_npk._packages) > 0, "expected multi-package routeros"
+          print("sys _packages len:", len(sys_npk._packages))
+          print("sys _parts ids:", [p.id for p in sys_npk._parts])
+          print("ros _packages len:", len(ros_npk._packages))
+          print("ros top _parts ids:", [p.id for p in ros_npk._parts])
+
+          def pkg_name(pkg):
+              try:
+                  return pkg[NpkPartID.NAME_INFO].data.name
+              except Exception as e:
+                  return f"<err {e}>"
+
+          if len(ros_npk._packages) == 0:
+              print("WARN: routeros has no subpackages, name=", pkg_name(ros_npk))
+              raise SystemExit("routeros is single-package; unexpected for mmips netinstall image")
 
           replaced = False
-          for i, pkg in enumerate(ros_npk._packages):
-              name = pkg[NpkPartID.NAME_INFO].data.name
+          for i, pkg in enumerate(list(ros_npk._packages)):
+              name = pkg_name(pkg)
               print(f"  subpackage[{i}]: {name}")
               if name == "system":
                   new_pkg = Package()
-                  for part in sys_npk._parts:
+                  src_parts = sys_npk._parts if len(sys_npk._packages) == 0 else sys_npk._packages[0]._parts
+                  for part in src_parts:
                       new_pkg._parts.append(NpkPartItem(part.id, part.data))
                   ros_npk._packages[i] = new_pkg
                   replaced = True
@@ -195,11 +208,14 @@ jobs:
 
           kcdsa = bytes.fromhex(os.environ["CUSTOM_LICENSE_PRIVATE_KEY"])
           eddsa = bytes.fromhex(os.environ["CUSTOM_NPK_SIGN_PRIVATE_KEY"])
+          print("signing combined routeros ...")
           ros_npk.sign(kcdsa, eddsa)
           ros_npk.save(str(ros_out))
 
           size = ros_out.stat().st_size
-          print(f"Final routeros size: {size} bytes ({size/1024/1024:.2f} MB)")
+          orig = ros_orig.stat().st_size
+          print(f"Original routeros size: {orig} bytes ({orig/1024/1024:.2f} MB)")
+          print(f"Final routeros size:    {size} bytes ({size/1024/1024:.2f} MB)")
           if size < 8_000_000:
               raise SystemExit(f"ERROR: routeros too small ({size}), expected ~10MB")
           print("OK: full routeros package built")
@@ -225,10 +241,10 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Full routeros-mmips package (~10MB) with patched system injected.
+            Full routeros-mmips (~10MB) with patched system injected.
 
-            Netinstall: use ONLY routeros-mmips-6.48.6.npk
-            Do not use system-*.npk alone as install image.
+            Netinstall: use ONLY routeros-mmips-6.48.6.npk (~10MB)
+            Do not flash system-*.npk alone as the install image.
           files: |
             output/routeros-mmips-6.48.6.npk
             output/system-6.48.6-mmips.npk
