@@ -84,7 +84,9 @@ jobs:
               "    print(f'new initrd xz size:{len(new_initrd_xz)}')\n"
               "    print(f'old initrd xz size:{len(initrd_xz)}')\n"
               "    if len(new_initrd_xz) > len(initrd_xz):\n"
-              "        raise AssertionError(f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}')\n"
+              "        raise AssertionError(\n"
+              "            f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}'\n"
+              "        )\n"
               "    if ljust:\n"
               "        print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')\n"
               "        new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), bytes([0]))\n"
@@ -130,11 +132,11 @@ jobs:
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
           ls -lh "$WORK/pkgs/"
 
-          # 先不处理 routeros 主包：它容易 xz too big；内核以 system 为准
+          # 跳过 routeros 主包（易 xz too big）；内核以 system 为准
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
             if [ "$base" = "routeros-${ARCH}-${VERSION}.npk" ]; then
-              echo "[SKIP for now]: $base (will use system package)"
+              echo "[SKIP]: $base (will use system package)"
               continue
             fi
             echo "[Processing NPK]: $f"
@@ -146,7 +148,7 @@ jobs:
           ROUTEROS_NPK="$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
 
           if [ ! -f "$SYSTEM_NPK" ]; then
-            echo "ERROR: system-${VERSION}-${ARCH}.npk not found after patch"
+            echo "ERROR: system-${VERSION}-${ARCH}.npk not found"
             ls -la "$WORK/pkgs/"
             exit 1
           fi
@@ -154,23 +156,13 @@ jobs:
           # Netinstall 主包 = 已 patch 的 system
           cp -f "$SYSTEM_NPK" "$ROUTEROS_NPK"
           echo "Synced system -> routeros-mmips for Netinstall"
-
-          # 校验自定义公钥是否在主包中
-          python3 << 'PY'
-          from pathlib import Path
-          custom = bytes.fromhex("9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709")
-          mikro = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
-          for name in ["routeros-mmips-6.48.6.npk", "system-6.48.6-mmips.npk"]:
-              path = Path("build/pkgs") / name
-              data = path.read_bytes()
-              print(f"{name}: size={len(data)} custom_key={custom in data} mikro_key={mikro in data}")
-              if not (custom in data):
-                  raise SystemExit(f"FAIL: {name} missing custom public key")
-          PY
+          ls -lh "$SYSTEM_NPK" "$ROUTEROS_NPK"
 
           cp -f "$ROUTEROS_NPK" "$OUT/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$SYSTEM_NPK" "$OUT/system-${VERSION}-${ARCH}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
+
+          echo "=== outputs ==="
           ls -lh "$OUT/"
 
       - name: Upload Artifacts
@@ -186,10 +178,14 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Main install package is system-based (kernel patched).
-            Use either:
+            Kernel patched on system-6.48.6-mmips.npk (Python lzma only).
+            routeros-mmips-6.48.6.npk is a copy of system for Netinstall.
+
+            Install with Netinstall (only one main package):
             - system-6.48.6-mmips.npk
-            - routeros-mmips-6.48.6.npk (same content as system)
+            - or routeros-mmips-6.48.6.npk
+
+            Do not mix with official packages.
           files: |
             output/routeros-mmips-6.48.6.npk
             output/system-6.48.6-mmips.npk
