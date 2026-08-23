@@ -32,7 +32,7 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py (Python lzma only, no system xz)
+      - name: Fix patch.py (Python lzma only)
         run: |
           set -euo pipefail
           python3 << 'PY'
@@ -43,8 +43,6 @@ jobs:
           end = t.find("\ndef find_7zXZ_data(", start)
           if start < 0 or end < 0:
               raise SystemExit("patch_initrd_xz not found")
-
-          # 只使用 Python lzma，避免 system xz 格式与内核不兼容导致重启
           new_fn = (
               "def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):\n"
               "    initrd = lzma.decompress(initrd_xz)\n"
@@ -77,7 +75,7 @@ jobs:
               "        try:\n"
               "            out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])\n"
               "            candidates.append(out)\n"
-              "            print(f'trial size={len(out)} preset={preset} dict={dict_size}')\n"
+              "            print(f'trial size={len(out)}')\n"
               "        except Exception as e:\n"
               "            print('trial failed:', e)\n"
               "    if not candidates:\n"
@@ -86,19 +84,10 @@ jobs:
               "    print(f'new initrd xz size:{len(new_initrd_xz)}')\n"
               "    print(f'old initrd xz size:{len(initrd_xz)}')\n"
               "    if len(new_initrd_xz) > len(initrd_xz):\n"
-              "        raise AssertionError(\n"
-              "            f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}'\n"
-              "        )\n"
+              "        raise AssertionError(f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}')\n"
               "    if ljust:\n"
               "        print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')\n"
               "        new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), bytes([0]))\n"
-              "    # 自检：必须能解压\n"
-              "    _ = lzma.decompress(new_initrd_xz.rstrip(bytes([0])) if False else new_initrd_xz[:len(new_initrd_xz)])\n"
-              "    try:\n"
-              "        lzma.decompress(new_initrd_xz)\n"
-              "    except Exception:\n"
-              "        # 带尾部 padding 时，只解压到原压缩长度前的有效流\n"
-              "        lzma.decompress(new_initrd_xz[:len(min(candidates, key=len))])\n"
               "    return new_initrd_xz\n"
               "\n"
           )
@@ -139,43 +128,48 @@ jobs:
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
-
-          echo "=== package list ==="
           ls -lh "$WORK/pkgs/"
 
+          # 先不处理 routeros 主包：它容易 xz too big；内核以 system 为准
           for f in "$WORK"/pkgs/*.npk; do
+            base=$(basename "$f")
+            if [ "$base" = "routeros-${ARCH}-${VERSION}.npk" ]; then
+              echo "[SKIP for now]: $base (will use system package)"
+              continue
+            fi
             echo "[Processing NPK]: $f"
             python3 patch.py npk "$f"
             python3 npk.py sign "$f" "$f"
           done
 
-          # 主包：优先保证 routeros-mmips 与已 patch 的 system 一致
-          # 若 system 含内核补丁而 routeros 不同，用 system 覆盖 routeros 供 Netinstall
-          if [ -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" ]; then
-            echo "Found system-${VERSION}-${ARCH}.npk"
-            # 以 routeros 名为 Netinstall 主包输出
-            cp -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
-            echo "Synced system -> routeros for Netinstall"
+          SYSTEM_NPK="$WORK/pkgs/system-${VERSION}-${ARCH}.npk"
+          ROUTEROS_NPK="$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
+
+          if [ ! -f "$SYSTEM_NPK" ]; then
+            echo "ERROR: system-${VERSION}-${ARCH}.npk not found after patch"
+            ls -la "$WORK/pkgs/"
+            exit 1
           fi
 
-          # 校验：自定义 NPK 公钥应出现在主包中
+          # Netinstall 主包 = 已 patch 的 system
+          cp -f "$SYSTEM_NPK" "$ROUTEROS_NPK"
+          echo "Synced system -> routeros-mmips for Netinstall"
+
+          # 校验自定义公钥是否在主包中
           python3 << 'PY'
           from pathlib import Path
           custom = bytes.fromhex("9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709")
           mikro = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
-          for name in [
-              "routeros-mmips-6.48.6.npk",
-              "system-6.48.6-mmips.npk",
-          ]:
+          for name in ["routeros-mmips-6.48.6.npk", "system-6.48.6-mmips.npk"]:
               path = Path("build/pkgs") / name
-              if not path.exists():
-                  print(f"MISSING {name}")
-                  continue
               data = path.read_bytes()
               print(f"{name}: size={len(data)} custom_key={custom in data} mikro_key={mikro in data}")
+              if not (custom in data):
+                  raise SystemExit(f"FAIL: {name} missing custom public key")
           PY
 
-          cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          cp -f "$ROUTEROS_NPK" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          cp -f "$SYSTEM_NPK" "$OUT/system-${VERSION}-${ARCH}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
           ls -lh "$OUT/"
 
@@ -192,10 +186,13 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            mmips 6.48.6 patched (Python-lzma only).
-            Netinstall with: routeros-mmips-6.48.6.npk
+            Main install package is system-based (kernel patched).
+            Use either:
+            - system-6.48.6-mmips.npk
+            - routeros-mmips-6.48.6.npk (same content as system)
           files: |
             output/routeros-mmips-6.48.6.npk
+            output/system-6.48.6-mmips.npk
             output/all_packages-mmips-6.48.6.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
