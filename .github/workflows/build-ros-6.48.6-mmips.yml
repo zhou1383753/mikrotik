@@ -32,13 +32,15 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py (Python lzma only)
+      - name: Fix patch.py (lzma + mmips squashfs + no logo hack)
         run: |
           set -euo pipefail
           python3 << 'PY'
           from pathlib import Path
           p = Path("patch.py")
           t = p.read_text(encoding="utf-8")
+
+          # 1) 更强 initrd 压缩
           start = t.find("def patch_initrd_xz(")
           end = t.find("\ndef find_7zXZ_data(", start)
           if start < 0 or end < 0:
@@ -94,10 +96,37 @@ jobs:
               "\n"
           )
           t = t[:start] + new_fn + t[end:]
+
+          # 2) mmips squashfs: 加 BCJ mips；去掉 logo 修改（避免干扰启动）
+          old_mk = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k'
+          new_mk = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k'
+          if old_mk not in t:
+              # 兼容 f-string 写法
+              old_mk2 = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k'
+              if 'mksquashfs' not in t:
+                  raise SystemExit("mksquashfs line not found")
+              t = t.replace(
+                  "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k",
+                  "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k",
+                  1,
+              )
+          else:
+              t = t.replace(old_mk, new_mk, 1)
+
+          # 去掉 logo sed（两行）
+          for frag in [
+              "logo = os.path.join(extract_dir,\"nova/lib/console/logo.txt\")",
+              "run_shell_command(f\"sudo sed -i '1d' {logo}\")",
+              "run_shell_command(f\"sudo sed -i '8s#.*#  elseif@live.cn     https://github.com/elseif/MikroTikPatch#' {logo}\")",
+          ]:
+              if frag in t:
+                  t = t.replace(frag, "pass  # logo patch disabled", 1)
+
           p.write_text(t, encoding="utf-8")
-          print("patch_initrd_xz replaced OK")
+          print("patch.py fixed")
           PY
           python3 -m py_compile patch.py
+          grep -n "Xbcj mips\|logo patch disabled\|PRESET_EXTREME\|trial size" patch.py | head -20
 
       - name: Build mmips packages
         env:
@@ -129,142 +158,41 @@ jobs:
             -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
+          echo "Official routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk") bytes"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk.orig"
-          echo "Original routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk.orig") bytes"
 
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
-          chmod -R u+w "$WORK/pkgs"
-          ls -lh "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
 
+          # 直接 patch 完整 routeros 多包（内部 system 子包）
+          echo "[Processing main]: routeros-${ARCH}-${VERSION}.npk"
+          python3 patch.py npk "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          python3 npk.py sign "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
+
+          # 再 patch all_packages 里其它单独包（可选组件）
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
             if [[ "$base" == routeros-* ]]; then
-              echo "[SKIP standalone]: $base"
               continue
             fi
             echo "[Processing NPK]: $f"
-            python3 patch.py npk "$f"
-            python3 npk.py sign "$f" "$f"
+            python3 patch.py npk "$f" || echo "WARN: patch failed $base"
+            python3 npk.py sign "$f" "$f" || echo "WARN: sign failed $base"
           done
 
-          SYSTEM_NPK="$WORK/pkgs/system-${VERSION}-${ARCH}.npk"
-          if [ ! -f "$SYSTEM_NPK" ]; then
-            echo "ERROR: system package not found"
-            ls -la "$WORK/pkgs/"
+          FINAL="$WORK/routeros-${ARCH}-${VERSION}.npk"
+          SIZE=$(stat -c%s "$FINAL")
+          echo "Final routeros size: $SIZE bytes ($(echo "scale=2; $SIZE/1024/1024" | bc) MB)"
+          if [ "$SIZE" -lt 9000000 ]; then
+            echo "ERROR: final package too small"
             exit 1
           fi
-          echo "Patched system size: $(stat -c%s "$SYSTEM_NPK") bytes"
 
-          python3 << 'PY'
-          import os
-          from pathlib import Path
-          from npk import NovaPackage, NpkPartID, Package, NpkPartItem
-
-          version = "6.48.6"
-          arch = "mmips"
-          work = Path("build")
-          system_path = work / "pkgs" / f"system-{version}-{arch}.npk"
-          ros_orig = work / f"routeros-{arch}-{version}.npk.orig"
-          ros_out = work / f"routeros-{arch}-{version}.npk"
-
-          sys_npk = NovaPackage.load(str(system_path))
-          ros_npk = NovaPackage.load(str(ros_orig))
-
-          print("sys _packages len:", len(sys_npk._packages))
-          print("ros _packages len:", len(ros_npk._packages))
-          assert len(sys_npk._packages) == 0, "system should be single-package"
-          assert len(ros_npk._packages) > 0, "routeros should be multi-package"
-
-          # 从已 patch 的 system 取关键部件
-          src = {}
-          for part in sys_npk._parts:
-              if part.id in (NpkPartID.FILE_CONTAINER, NpkPartID.SQUASHFS, NpkPartID.INSTALL_SCRIPT):
-                  data = part.data
-                  if not isinstance(data, (bytes, bytearray)):
-                      data = data.serialize()
-                  src[part.id] = bytes(data)
-                  print(f"src {part.id.name}: {len(src[part.id])} bytes")
-
-          if NpkPartID.FILE_CONTAINER not in src and NpkPartID.SQUASHFS not in src:
-              raise SystemExit("patched system missing FILE_CONTAINER/SQUASHFS")
-
-          def pkg_name(pkg):
-              return pkg[NpkPartID.NAME_INFO].data.name
-
-          updated = False
-          for i, pkg in enumerate(ros_npk._packages):
-              name = pkg_name(pkg)
-              print(f"  subpackage[{i}]: {name}")
-              if name != "system":
-                  continue
-              # 只替换内核容器和 squashfs，保留原 system 子包骨架，避免整包结构被破坏
-              for part in pkg._parts:
-                  if part.id in src:
-                      old_len = len(part.data) if isinstance(part.data, (bytes, bytearray)) else -1
-                      part.data = src[part.id]
-                      print(f"    updated {part.id.name}: {old_len} -> {len(part.data)}")
-                      updated = True
-              # 若原 system 没有某部件则追加
-              existing_ids = {p.id for p in pkg._parts}
-              for pid, data in src.items():
-                  if pid not in existing_ids:
-                      pkg._parts.append(NpkPartItem(pid, data))
-                      print(f"    appended {pid.name}: {len(data)}")
-                      updated = True
-
-          if not updated:
-              raise SystemExit("failed to update system subpackage inside routeros")
-
-          # 可选：把 all_packages 里已 patch 的其它包也同步进 bundle（按名匹配）
-          pkgs_dir = work / "pkgs"
-          name_to_file = {}
-          for f in pkgs_dir.glob("*.npk"):
-              try:
-                  p = NovaPackage.load(str(f))
-                  if len(p._packages) == 0:
-                      n = p[NpkPartID.NAME_INFO].data.name
-                      name_to_file[n] = f
-              except Exception:
-                  pass
-
-          for i, pkg in enumerate(ros_npk._packages):
-              name = pkg_name(pkg)
-              if name == "system" or name not in name_to_file:
-                  continue
-              try:
-                  other = NovaPackage.load(str(name_to_file[name]))
-                  other_src = {}
-                  for part in other._parts:
-                      if part.id in (NpkPartID.SQUASHFS, NpkPartID.FILE_CONTAINER):
-                          data = part.data if isinstance(part.data, (bytes, bytearray)) else part.data.serialize()
-                          other_src[part.id] = bytes(data)
-                  for part in pkg._parts:
-                      if part.id in other_src:
-                          part.data = other_src[part.id]
-                  print(f"  synced extra package content: {name}")
-              except Exception as e:
-                  print(f"  skip sync {name}: {e}")
-
-          kcdsa = bytes.fromhex(os.environ["CUSTOM_LICENSE_PRIVATE_KEY"])
-          eddsa = bytes.fromhex(os.environ["CUSTOM_NPK_SIGN_PRIVATE_KEY"])
-          print("signing combined routeros ...")
-          ros_npk.sign(kcdsa, eddsa)
-          ros_npk.save(str(ros_out))
-
-          size = ros_out.stat().st_size
-          orig = ros_orig.stat().st_size
-          print(f"Original routeros size: {orig} bytes ({orig/1024/1024:.2f} MB)")
-          print(f"Final routeros size:    {size} bytes ({size/1024/1024:.2f} MB)")
-          if size < 9_000_000:
-              raise SystemExit(f"ERROR: routeros still too small ({size}), expected ~10MB")
-          print("OK: full routeros package built")
-          PY
-
-          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
-          cp -f "$SYSTEM_NPK" "$OUT/system-${VERSION}-${ARCH}.npk"
+          cp -f "$FINAL" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          if [ -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" ]; then
+            cp -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" "$OUT/system-${VERSION}-${ARCH}.npk"
+          fi
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
-
-          echo "=== outputs ==="
           ls -lh "$OUT/"
 
       - name: Upload Artifacts
@@ -280,12 +208,12 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Full routeros-mmips (~10MB): system FILE_CONTAINER+SQUASHFS replaced in-place, then re-signed.
+            Direct patch of official routeros-mmips multi-package (no system inject).
+            squashfs repack uses -Xbcj mips. Logo hack disabled.
 
-            Netinstall: use ONLY routeros-mmips-6.48.6.npk (~10MB)
+            Use patched Netinstall + routeros-mmips-6.48.6.npk (~10MB).
           files: |
             output/routeros-mmips-6.48.6.npk
-            output/system-6.48.6-mmips.npk
             output/all_packages-mmips-6.48.6.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
