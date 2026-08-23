@@ -32,7 +32,7 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py for mmips initrd
+      - name: Fix patch.py (Python lzma only, no system xz)
         run: |
           set -euo pipefail
           python3 << 'PY'
@@ -44,9 +44,9 @@ jobs:
           if start < 0 or end < 0:
               raise SystemExit("patch_initrd_xz not found")
 
+          # 只使用 Python lzma，避免 system xz 格式与内核不兼容导致重启
           new_fn = (
               "def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):\n"
-              "    import subprocess, tempfile, os\n"
               "    initrd = lzma.decompress(initrd_xz)\n"
               "    new_initrd = initrd\n"
               "    for old_public_key,new_public_key in key_dict.items():\n"
@@ -55,18 +55,16 @@ jobs:
               "            new_initrd = new_initrd.replace(old_public_key,new_public_key)\n"
               "    candidates = []\n"
               "    trials = [\n"
+              "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 4, 0, 0),\n"
               "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),\n"
               "        (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),\n"
               "        (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),\n"
               "        (9 | lzma.PRESET_EXTREME, 4*1024*1024, 3, 0, 2),\n"
-              "        (9 | lzma.PRESET_EXTREME, 2*1024*1024, 3, 0, 2),\n"
-              "        (9 | lzma.PRESET_EXTREME, 1*1024*1024, 3, 0, 2),\n"
               "        (9, 8*1024*1024, 3, 0, 2),\n"
-              "        (9, 4*1024*1024, 3, 0, 2),\n"
               "        (9, None, None, None, None),\n"
+              "        (8, None, None, None, None),\n"
               "        (7, None, None, None, None),\n"
               "        (6, None, None, None, None),\n"
-              "        (5, None, None, None, None),\n"
               "    ]\n"
               "    for preset, dict_size, lc, lp, pb in trials:\n"
               "        filt = {'id': lzma.FILTER_LZMA2, 'preset': preset}\n"
@@ -79,28 +77,9 @@ jobs:
               "        try:\n"
               "            out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])\n"
               "            candidates.append(out)\n"
+              "            print(f'trial size={len(out)} preset={preset} dict={dict_size}')\n"
               "        except Exception as e:\n"
-              "            print('py lzma trial failed:', e)\n"
-              "    try:\n"
-              "        with tempfile.TemporaryDirectory() as td:\n"
-              "            raw = os.path.join(td, 'in.bin')\n"
-              "            open(raw, 'wb').write(new_initrd)\n"
-              "            for extra in [\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-9e', '--lzma2=dict=32MiB'],\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-9e', '--lzma2=dict=16MiB'],\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-9e', '--lzma2=dict=8MiB'],\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-9e'],\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-9'],\n"
-              "                ['-C', 'crc32', '-F', 'xz', '-7'],\n"
-              "            ]:\n"
-              "                cmd = ['xz', '-k', '-f', '-c'] + extra + [raw]\n"
-              "                try:\n"
-              "                    data = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)\n"
-              "                    candidates.append(data)\n"
-              "                except Exception as e:\n"
-              "                    print('xz trial failed:', extra, e)\n"
-              "    except Exception as e:\n"
-              "        print('xz tool path failed:', e)\n"
+              "            print('trial failed:', e)\n"
               "    if not candidates:\n"
               "        raise RuntimeError('no compress candidates')\n"
               "    new_initrd_xz = min(candidates, key=len)\n"
@@ -108,12 +87,18 @@ jobs:
               "    print(f'old initrd xz size:{len(initrd_xz)}')\n"
               "    if len(new_initrd_xz) > len(initrd_xz):\n"
               "        raise AssertionError(\n"
-              "            f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}. '\n"
-              "            f'Refusing to build boot-breaking package.'\n"
+              "            f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}'\n"
               "        )\n"
               "    if ljust:\n"
               "        print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')\n"
               "        new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), bytes([0]))\n"
+              "    # 自检：必须能解压\n"
+              "    _ = lzma.decompress(new_initrd_xz.rstrip(bytes([0])) if False else new_initrd_xz[:len(new_initrd_xz)])\n"
+              "    try:\n"
+              "        lzma.decompress(new_initrd_xz)\n"
+              "    except Exception:\n"
+              "        # 带尾部 padding 时，只解压到原压缩长度前的有效流\n"
+              "        lzma.decompress(new_initrd_xz[:len(min(candidates, key=len))])\n"
               "    return new_initrd_xz\n"
               "\n"
           )
@@ -136,8 +121,6 @@ jobs:
           CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xz-utils
 
           VERSION="6.48.6"
           ARCH="mmips"
@@ -157,11 +140,40 @@ jobs:
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
 
+          echo "=== package list ==="
+          ls -lh "$WORK/pkgs/"
+
           for f in "$WORK"/pkgs/*.npk; do
             echo "[Processing NPK]: $f"
             python3 patch.py npk "$f"
             python3 npk.py sign "$f" "$f"
           done
+
+          # 主包：优先保证 routeros-mmips 与已 patch 的 system 一致
+          # 若 system 含内核补丁而 routeros 不同，用 system 覆盖 routeros 供 Netinstall
+          if [ -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" ]; then
+            echo "Found system-${VERSION}-${ARCH}.npk"
+            # 以 routeros 名为 Netinstall 主包输出
+            cp -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
+            echo "Synced system -> routeros for Netinstall"
+          fi
+
+          # 校验：自定义 NPK 公钥应出现在主包中
+          python3 << 'PY'
+          from pathlib import Path
+          custom = bytes.fromhex("9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709")
+          mikro = bytes.fromhex("C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59")
+          for name in [
+              "routeros-mmips-6.48.6.npk",
+              "system-6.48.6-mmips.npk",
+          ]:
+              path = Path("build/pkgs") / name
+              if not path.exists():
+                  print(f"MISSING {name}")
+                  continue
+              data = path.read_bytes()
+              print(f"{name}: size={len(data)} custom_key={custom in data} mikro_key={mikro in data}")
+          PY
 
           cp -f "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
@@ -180,8 +192,8 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            RouterOS 6.48.6 mmips patched.
-            Build fails if kernel initrd xz cannot fit.
+            mmips 6.48.6 patched (Python-lzma only).
+            Netinstall with: routeros-mmips-6.48.6.npk
           files: |
             output/routeros-mmips-6.48.6.npk
             output/all_packages-mmips-6.48.6.zip
