@@ -167,44 +167,83 @@ jobs:
           ros_orig = work / f"routeros-{arch}-{version}.npk.orig"
           ros_out = work / f"routeros-{arch}-{version}.npk"
 
-          print("system_path exists:", system_path.exists(), system_path)
-          print("ros_orig exists:", ros_orig.exists(), ros_orig)
-          if not system_path.exists() or not ros_orig.exists():
-              raise SystemExit("missing system or routeros.orig")
-
           sys_npk = NovaPackage.load(str(system_path))
           ros_npk = NovaPackage.load(str(ros_orig))
 
           print("sys _packages len:", len(sys_npk._packages))
-          print("sys _parts ids:", [p.id for p in sys_npk._parts])
           print("ros _packages len:", len(ros_npk._packages))
-          print("ros top _parts ids:", [p.id for p in ros_npk._parts])
+          assert len(sys_npk._packages) == 0, "system should be single-package"
+          assert len(ros_npk._packages) > 0, "routeros should be multi-package"
+
+          # 从已 patch 的 system 取关键部件
+          src = {}
+          for part in sys_npk._parts:
+              if part.id in (NpkPartID.FILE_CONTAINER, NpkPartID.SQUASHFS, NpkPartID.INSTALL_SCRIPT):
+                  data = part.data
+                  if not isinstance(data, (bytes, bytearray)):
+                      data = data.serialize()
+                  src[part.id] = bytes(data)
+                  print(f"src {part.id.name}: {len(src[part.id])} bytes")
+
+          if NpkPartID.FILE_CONTAINER not in src and NpkPartID.SQUASHFS not in src:
+              raise SystemExit("patched system missing FILE_CONTAINER/SQUASHFS")
 
           def pkg_name(pkg):
-              try:
-                  return pkg[NpkPartID.NAME_INFO].data.name
-              except Exception as e:
-                  return f"<err {e}>"
+              return pkg[NpkPartID.NAME_INFO].data.name
 
-          if len(ros_npk._packages) == 0:
-              print("WARN: routeros has no subpackages, name=", pkg_name(ros_npk))
-              raise SystemExit("routeros is single-package; unexpected for mmips netinstall image")
-
-          replaced = False
-          for i, pkg in enumerate(list(ros_npk._packages)):
+          updated = False
+          for i, pkg in enumerate(ros_npk._packages):
               name = pkg_name(pkg)
               print(f"  subpackage[{i}]: {name}")
-              if name == "system":
-                  new_pkg = Package()
-                  src_parts = sys_npk._parts if len(sys_npk._packages) == 0 else sys_npk._packages[0]._parts
-                  for part in src_parts:
-                      new_pkg._parts.append(NpkPartItem(part.id, part.data))
-                  ros_npk._packages[i] = new_pkg
-                  replaced = True
-                  print("  -> replaced with patched system")
+              if name != "system":
+                  continue
+              # 只替换内核容器和 squashfs，保留原 system 子包骨架，避免整包结构被破坏
+              for part in pkg._parts:
+                  if part.id in src:
+                      old_len = len(part.data) if isinstance(part.data, (bytes, bytearray)) else -1
+                      part.data = src[part.id]
+                      print(f"    updated {part.id.name}: {old_len} -> {len(part.data)}")
+                      updated = True
+              # 若原 system 没有某部件则追加
+              existing_ids = {p.id for p in pkg._parts}
+              for pid, data in src.items():
+                  if pid not in existing_ids:
+                      pkg._parts.append(NpkPartItem(pid, data))
+                      print(f"    appended {pid.name}: {len(data)}")
+                      updated = True
 
-          if not replaced:
-              raise SystemExit("system subpackage not found inside routeros")
+          if not updated:
+              raise SystemExit("failed to update system subpackage inside routeros")
+
+          # 可选：把 all_packages 里已 patch 的其它包也同步进 bundle（按名匹配）
+          pkgs_dir = work / "pkgs"
+          name_to_file = {}
+          for f in pkgs_dir.glob("*.npk"):
+              try:
+                  p = NovaPackage.load(str(f))
+                  if len(p._packages) == 0:
+                      n = p[NpkPartID.NAME_INFO].data.name
+                      name_to_file[n] = f
+              except Exception:
+                  pass
+
+          for i, pkg in enumerate(ros_npk._packages):
+              name = pkg_name(pkg)
+              if name == "system" or name not in name_to_file:
+                  continue
+              try:
+                  other = NovaPackage.load(str(name_to_file[name]))
+                  other_src = {}
+                  for part in other._parts:
+                      if part.id in (NpkPartID.SQUASHFS, NpkPartID.FILE_CONTAINER):
+                          data = part.data if isinstance(part.data, (bytes, bytearray)) else part.data.serialize()
+                          other_src[part.id] = bytes(data)
+                  for part in pkg._parts:
+                      if part.id in other_src:
+                          part.data = other_src[part.id]
+                  print(f"  synced extra package content: {name}")
+              except Exception as e:
+                  print(f"  skip sync {name}: {e}")
 
           kcdsa = bytes.fromhex(os.environ["CUSTOM_LICENSE_PRIVATE_KEY"])
           eddsa = bytes.fromhex(os.environ["CUSTOM_NPK_SIGN_PRIVATE_KEY"])
@@ -216,8 +255,8 @@ jobs:
           orig = ros_orig.stat().st_size
           print(f"Original routeros size: {orig} bytes ({orig/1024/1024:.2f} MB)")
           print(f"Final routeros size:    {size} bytes ({size/1024/1024:.2f} MB)")
-          if size < 8_000_000:
-              raise SystemExit(f"ERROR: routeros too small ({size}), expected ~10MB")
+          if size < 9_000_000:
+              raise SystemExit(f"ERROR: routeros still too small ({size}), expected ~10MB")
           print("OK: full routeros package built")
           PY
 
@@ -241,10 +280,9 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Full routeros-mmips (~10MB) with patched system injected.
+            Full routeros-mmips (~10MB): system FILE_CONTAINER+SQUASHFS replaced in-place, then re-signed.
 
             Netinstall: use ONLY routeros-mmips-6.48.6.npk (~10MB)
-            Do not flash system-*.npk alone as the install image.
           files: |
             output/routeros-mmips-6.48.6.npk
             output/system-6.48.6-mmips.npk
