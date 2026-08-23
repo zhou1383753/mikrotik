@@ -32,7 +32,7 @@ jobs:
           test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
           python3 -m py_compile patch.py npk.py
 
-      - name: Fix patch.py (lzma + mmips squashfs + no logo hack)
+      - name: Fix patch.py (lzma + no logo)
         run: |
           set -euo pipefail
           python3 << 'PY'
@@ -40,7 +40,6 @@ jobs:
           p = Path("patch.py")
           t = p.read_text(encoding="utf-8")
 
-          # 1) 更强 initrd 压缩
           start = t.find("def patch_initrd_xz(")
           end = t.find("\ndef find_7zXZ_data(", start)
           if start < 0 or end < 0:
@@ -97,23 +96,12 @@ jobs:
           )
           t = t[:start] + new_fn + t[end:]
 
-          # 2) mmips squashfs: 加 BCJ mips；去掉 logo 修改（避免干扰启动）
-          old_mk = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k'
-          new_mk = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k'
-          if old_mk not in t:
-              # 兼容 f-string 写法
-              old_mk2 = 'mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k'
-              if 'mksquashfs' not in t:
-                  raise SystemExit("mksquashfs line not found")
-              t = t.replace(
-                  "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k",
-                  "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k",
-                  1,
-              )
-          else:
-              t = t.replace(old_mk, new_mk, 1)
+          # 若上次改成了 Xbcj mips，改回原版参数
+          t = t.replace(
+              "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k",
+              "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k",
+          )
 
-          # 去掉 logo sed（两行）
           for frag in [
               "logo = os.path.join(extract_dir,\"nova/lib/console/logo.txt\")",
               "run_shell_command(f\"sudo sed -i '1d' {logo}\")",
@@ -126,7 +114,7 @@ jobs:
           print("patch.py fixed")
           PY
           python3 -m py_compile patch.py
-          grep -n "Xbcj mips\|logo patch disabled\|PRESET_EXTREME\|trial size" patch.py | head -20
+          grep -n "mksquashfs\|logo patch disabled" patch.py | head -10
 
       - name: Build mmips packages
         env:
@@ -159,17 +147,14 @@ jobs:
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
           echo "Official routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk") bytes"
-          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk.orig"
 
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
           chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
 
-          # 直接 patch 完整 routeros 多包（内部 system 子包）
           echo "[Processing main]: routeros-${ARCH}-${VERSION}.npk"
           python3 patch.py npk "$WORK/routeros-${ARCH}-${VERSION}.npk"
           python3 npk.py sign "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
 
-          # 再 patch all_packages 里其它单独包（可选组件）
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
             if [[ "$base" == routeros-* ]]; then
@@ -182,16 +167,13 @@ jobs:
 
           FINAL="$WORK/routeros-${ARCH}-${VERSION}.npk"
           SIZE=$(stat -c%s "$FINAL")
-          echo "Final routeros size: $SIZE bytes ($(echo "scale=2; $SIZE/1024/1024" | bc) MB)"
+          echo "Final routeros size: $SIZE bytes"
           if [ "$SIZE" -lt 9000000 ]; then
             echo "ERROR: final package too small"
             exit 1
           fi
 
           cp -f "$FINAL" "$OUT/routeros-${ARCH}-${VERSION}.npk"
-          if [ -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" ]; then
-            cp -f "$WORK/pkgs/system-${VERSION}-${ARCH}.npk" "$OUT/system-${VERSION}-${ARCH}.npk"
-          fi
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
           ls -lh "$OUT/"
 
@@ -208,8 +190,8 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Direct patch of official routeros-mmips multi-package (no system inject).
-            squashfs repack uses -Xbcj mips. Logo hack disabled.
+            Direct patch of official routeros-mmips multi-package.
+            Kernel initrd fitted; squashfs standard xz; no logo hack.
 
             Use patched Netinstall + routeros-mmips-6.48.6.npk (~10MB).
           files: |
