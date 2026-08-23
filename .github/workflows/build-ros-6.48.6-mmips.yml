@@ -112,6 +112,8 @@ jobs:
           CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
 
           VERSION="6.48.6"
           ARCH="mmips"
@@ -127,16 +129,19 @@ jobs:
             -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
             "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
 
+          # 保留原始完整 routeros（约 10MB）供注入
+          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk.orig"
+          echo "Original routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk.orig") bytes"
+
           unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
-          chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
-          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
+          chmod -R u+w "$WORK/pkgs"
           ls -lh "$WORK/pkgs/"
 
-          # 跳过 routeros 主包（易 xz too big）；内核以 system 为准
+          # 1) patch all_packages 里每个包（含 system）；跳过单独的 routeros 文件若存在
           for f in "$WORK"/pkgs/*.npk; do
             base=$(basename "$f")
-            if [ "$base" = "routeros-${ARCH}-${VERSION}.npk" ]; then
-              echo "[SKIP]: $base (will use system package)"
+            if [[ "$base" == routeros-* ]]; then
+              echo "[SKIP standalone]: $base"
               continue
             fi
             echo "[Processing NPK]: $f"
@@ -145,20 +150,62 @@ jobs:
           done
 
           SYSTEM_NPK="$WORK/pkgs/system-${VERSION}-${ARCH}.npk"
-          ROUTEROS_NPK="$WORK/pkgs/routeros-${ARCH}-${VERSION}.npk"
-
           if [ ! -f "$SYSTEM_NPK" ]; then
-            echo "ERROR: system-${VERSION}-${ARCH}.npk not found"
+            echo "ERROR: system package not found"
             ls -la "$WORK/pkgs/"
             exit 1
           fi
+          echo "Patched system size: $(stat -c%s "$SYSTEM_NPK") bytes"
 
-          # Netinstall 主包 = 已 patch 的 system
-          cp -f "$SYSTEM_NPK" "$ROUTEROS_NPK"
-          echo "Synced system -> routeros-mmips for Netinstall"
-          ls -lh "$SYSTEM_NPK" "$ROUTEROS_NPK"
+          # 2) 把已 patch 的 system 注入到完整 routeros 多包中，再整体签名
+          python3 << 'PY'
+          import os
+          from pathlib import Path
+          from npk import NovaPackage, NpkPartID, Package, NpkPartItem
 
-          cp -f "$ROUTEROS_NPK" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          version = "6.48.6"
+          arch = "mmips"
+          work = Path("build")
+          system_path = work / "pkgs" / f"system-{version}-{arch}.npk"
+          ros_orig = work / f"routeros-{arch}-{version}.npk.orig"
+          ros_out = work / f"routeros-{arch}-{version}.npk"
+
+          sys_npk = NovaPackage.load(str(system_path))
+          ros_npk = NovaPackage.load(str(ros_orig))
+
+          print(f"system is multi-package: {len(sys_npk._packages) > 0}")
+          print(f"routeros subpackages: {len(ros_npk._packages)}")
+          assert len(sys_npk._packages) == 0, "expected single system package"
+          assert len(ros_npk._packages) > 0, "expected multi-package routeros"
+
+          replaced = False
+          for i, pkg in enumerate(ros_npk._packages):
+              name = pkg[NpkPartID.NAME_INFO].data.name
+              print(f"  subpackage[{i}]: {name}")
+              if name == "system":
+                  new_pkg = Package()
+                  for part in sys_npk._parts:
+                      new_pkg._parts.append(NpkPartItem(part.id, part.data))
+                  ros_npk._packages[i] = new_pkg
+                  replaced = True
+                  print("  -> replaced with patched system")
+
+          if not replaced:
+              raise SystemExit("system subpackage not found inside routeros")
+
+          kcdsa = bytes.fromhex(os.environ["CUSTOM_LICENSE_PRIVATE_KEY"])
+          eddsa = bytes.fromhex(os.environ["CUSTOM_NPK_SIGN_PRIVATE_KEY"])
+          ros_npk.sign(kcdsa, eddsa)
+          ros_npk.save(str(ros_out))
+
+          size = ros_out.stat().st_size
+          print(f"Final routeros size: {size} bytes ({size/1024/1024:.2f} MB)")
+          if size < 8_000_000:
+              raise SystemExit(f"ERROR: routeros too small ({size}), expected ~10MB")
+          print("OK: full routeros package built")
+          PY
+
+          cp -f "$WORK/routeros-${ARCH}-${VERSION}.npk" "$OUT/routeros-${ARCH}-${VERSION}.npk"
           cp -f "$SYSTEM_NPK" "$OUT/system-${VERSION}-${ARCH}.npk"
           (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
 
@@ -178,14 +225,10 @@ jobs:
           tag_name: v6.48.6-mmips-patched-${{ github.run_id }}
           name: RouterOS 6.48.6 stable mmips
           body: |
-            Kernel patched on system-6.48.6-mmips.npk (Python lzma only).
-            routeros-mmips-6.48.6.npk is a copy of system for Netinstall.
+            Full routeros-mmips package (~10MB) with patched system injected.
 
-            Install with Netinstall (only one main package):
-            - system-6.48.6-mmips.npk
-            - or routeros-mmips-6.48.6.npk
-
-            Do not mix with official packages.
+            Netinstall: use ONLY routeros-mmips-6.48.6.npk
+            Do not use system-*.npk alone as install image.
           files: |
             output/routeros-mmips-6.48.6.npk
             output/system-6.48.6-mmips.npk
