@@ -1,0 +1,273 @@
+name: Build and Release RouterOS 6.48.6 arm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f patch.py
+          test -f npk.py
+          test -n "${CUSTOM_NPK_SIGN_PRIVATE_KEY}"
+          test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
+          python3 -m py_compile patch.py npk.py
+          # npk.py 需要有 create 子命令
+          python3 npk.py 2>&1 | grep -qi create || echo "WARN: check npk.py create support"
+
+      - name: Fix patch.py (lzma + no logo)
+        run: |
+          set -euo pipefail
+          python3 << 'PY'
+          from pathlib import Path
+          p = Path("patch.py")
+          t = p.read_text(encoding="utf-8")
+
+          start = t.find("def patch_initrd_xz(")
+          end = t.find("\ndef find_7zXZ_data(", start)
+          if start < 0 or end < 0:
+              raise SystemExit("patch_initrd_xz not found")
+          new_fn = (
+              "def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):\n"
+              "    initrd = lzma.decompress(initrd_xz)\n"
+              "    new_initrd = initrd\n"
+              "    for old_public_key,new_public_key in key_dict.items():\n"
+              "        if old_public_key in new_initrd:\n"
+              "            print(f'initrd public key patched {old_public_key[:16].hex().upper()}...')\n"
+              "            new_initrd = new_initrd.replace(old_public_key,new_public_key)\n"
+              "    candidates = []\n"
+              "    trials = [\n"
+              "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 4, 0, 0),\n"
+              "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),\n"
+              "        (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),\n"
+              "        (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),\n"
+              "        (9 | lzma.PRESET_EXTREME, 4*1024*1024, 3, 0, 2),\n"
+              "        (9, 8*1024*1024, 3, 0, 2),\n"
+              "        (9, None, None, None, None),\n"
+              "        (8, None, None, None, None),\n"
+              "        (7, None, None, None, None),\n"
+              "        (6, None, None, None, None),\n"
+              "    ]\n"
+              "    for preset, dict_size, lc, lp, pb in trials:\n"
+              "        filt = {'id': lzma.FILTER_LZMA2, 'preset': preset}\n"
+              "        if dict_size is not None:\n"
+              "            filt['dict_size'] = dict_size\n"
+              "        if lc is not None:\n"
+              "            filt['lc'] = lc\n"
+              "            filt['lp'] = lp\n"
+              "            filt['pb'] = pb\n"
+              "        try:\n"
+              "            out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])\n"
+              "            candidates.append(out)\n"
+              "            print(f'trial size={len(out)}')\n"
+              "        except Exception as e:\n"
+              "            print('trial failed:', e)\n"
+              "    if not candidates:\n"
+              "        raise RuntimeError('no compress candidates')\n"
+              "    new_initrd_xz = min(candidates, key=len)\n"
+              "    print(f'new initrd xz size:{len(new_initrd_xz)}')\n"
+              "    print(f'old initrd xz size:{len(initrd_xz)}')\n"
+              "    if len(new_initrd_xz) > len(initrd_xz):\n"
+              "        raise AssertionError(\n"
+              "            f'new initrd xz size is too big: new={len(new_initrd_xz)} old={len(initrd_xz)}'\n"
+              "        )\n"
+              "    if ljust:\n"
+              "        print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')\n"
+              "        new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), bytes([0]))\n"
+              "    return new_initrd_xz\n"
+              "\n"
+          )
+          t = t[:start] + new_fn + t[end:]
+          t = t.replace(
+              "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -Xbcj mips -no-xattrs -b 256k",
+              "mksquashfs {extract_dir} {squashfs_file} -quiet -comp xz -no-xattrs -b 256k",
+          )
+          for frag in [
+              "logo = os.path.join(extract_dir,\"nova/lib/console/logo.txt\")",
+              "run_shell_command(f\"sudo sed -i '1d' {logo}\")",
+              "run_shell_command(f\"sudo sed -i '8s#.*#  elseif@live.cn     https://github.com/elseif/MikroTikPatch#' {logo}\")",
+          ]:
+              if frag in t:
+                  t = t.replace(frag, "pass  # logo patch disabled", 1)
+          p.write_text(t, encoding="utf-8")
+          print("patch.py fixed")
+          PY
+          python3 -m py_compile patch.py
+
+      - name: Build arm packages + option
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
+
+          VERSION="6.48.6"
+          ARCH="arm"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/pkgs" "$OUT" "$WORK/option-root/bin"
+
+          # 1) 下载官方包
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/routeros-${ARCH}-${VERSION}.npk" \
+            "https://download.mikrotik.com/routeros/${VERSION}/routeros-${ARCH}-${VERSION}.npk"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+
+          echo "Official routeros size: $(stat -c%s "$WORK/routeros-${ARCH}-${VERSION}.npk") bytes"
+          unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          ls -lh "$WORK/pkgs/"
+
+          # 2) 下载 arm busybox / keygen（elseif 历史提交里有 busybox_arm）
+          wget -nv -O "$WORK/busybox_arm" \
+            "https://raw.githubusercontent.com/elseif/MikroTikPatch/ee6d299e/busybox/busybox_arm"
+          wget -nv -O "$WORK/keygen_arm" \
+            "https://raw.githubusercontent.com/elseif/MikroTikPatch/ee6d299e/keygen/keygen_arm" || true
+          chmod +x "$WORK/busybox_arm"
+          test -s "$WORK/busybox_arm"
+
+          # 3) 制作 option squashfs（挂载点 /pckg/option）
+          cp "$WORK/busybox_arm" "$WORK/option-root/bin/busybox"
+          chmod +x "$WORK/option-root/bin/busybox"
+          if [ -s "$WORK/keygen_arm" ]; then
+            cp "$WORK/keygen_arm" "$WORK/option-root/bin/keygen"
+            chmod +x "$WORK/option-root/bin/keygen"
+          fi
+
+          # 用 x86 busybox --list 生成命令列表（仅作名字列表，实际执行仍是 arm busybox）
+          wget -nv -O "$WORK/busybox_x86" \
+            "https://raw.githubusercontent.com/elseif/MikroTikPatch/main/busybox/busybox_x86"
+          chmod +x "$WORK/busybox_x86"
+          COMMANDS=$("$WORK/busybox_x86" --list || true)
+          if [ -z "$COMMANDS" ]; then
+            COMMANDS="sh ls cat cp mv rm mkdir echo grep find vi tar gzip wget"
+          fi
+          for cmd in $COMMANDS; do
+            ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/$cmd"
+          done
+
+          mksquashfs "$WORK/option-root" "$WORK/option.sfs" \
+            -no-recovery -noappend -exit-on-error -quiet -comp xz -no-xattrs -b 256k -all-root
+          ls -lh "$WORK/option.sfs"
+
+          # 4) 用 gps（或其它小包）作模板创建 option-*.npk
+          TEMPLATE=""
+          for cand in \
+            "$WORK/pkgs/gps-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ntp-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ups-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/iot-${VERSION}-${ARCH}.npk"
+          do
+            if [ -f "$cand" ]; then
+              TEMPLATE="$cand"
+              break
+            fi
+          done
+          if [ -z "$TEMPLATE" ]; then
+            # 任意一个非 system 的小包
+            TEMPLATE=$(ls "$WORK"/pkgs/*.npk | grep -v system | grep -v routeros | head -1)
+          fi
+          echo "option template: $TEMPLATE"
+          test -n "$TEMPLATE" && test -f "$TEMPLATE"
+
+          OPTION_NPK="$WORK/pkgs/option-${VERSION}-${ARCH}.npk"
+          python3 npk.py create "$TEMPLATE" "$OPTION_NPK" option "$WORK/option.sfs" -desc="busybox"
+          test -s "$OPTION_NPK"
+          echo "Created option package: $(stat -c%s "$OPTION_NPK") bytes"
+          ls -lh "$OPTION_NPK"
+
+          # 5) patch + sign 主包 routeros
+          echo "[Processing main]: routeros-${ARCH}-${VERSION}.npk"
+          python3 patch.py npk "$WORK/routeros-${ARCH}-${VERSION}.npk"
+          python3 npk.py sign "$WORK/routeros-${ARCH}-${VERSION}.npk" "$WORK/routeros-${ARCH}-${VERSION}.npk"
+
+          # 6) patch + sign all_packages（含 option）
+          for f in "$WORK"/pkgs/*.npk; do
+            base=$(basename "$f")
+            if [[ "$base" == routeros-* ]]; then
+              continue
+            fi
+            echo "[Processing NPK]: $f"
+            # option 本身无 system 内核，patch.py 可能只做签名相关；失败不中断
+            python3 patch.py npk "$f" || echo "WARN: patch skipped/failed for $base"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          FINAL="$WORK/routeros-${ARCH}-${VERSION}.npk"
+          SIZE=$(stat -c%s "$FINAL")
+          echo "Final routeros size: $SIZE bytes"
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "ERROR: final package too small"
+            exit 1
+          fi
+
+          cp -f "$FINAL" "$OUT/routeros-${ARCH}-${VERSION}.npk"
+          cp -f "$OPTION_NPK" "$OUT/option-${VERSION}-${ARCH}.npk"
+          (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
+
+          echo "=== outputs ==="
+          ls -lh "$OUT/"
+          unzip -l "$OUT/all_packages-${ARCH}-${VERSION}.zip" | grep -i option || true
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-6.48.6-Patched-arm
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.48.6-arm-patched-${{ github.run_id }}
+          name: RouterOS 6.48.6 stable arm (+option)
+          body: |
+            RouterOS 6.48.6 arm patched, includes option package (busybox shell).
+
+            Assets:
+            - routeros-arm-6.48.6.npk
+            - option-6.48.6-arm.npk
+            - all_packages-arm-6.48.6.zip (contains option)
+
+            After install option:
+            - /system/shell  or  /sh
+            - ssh devel@router (password = admin password)
+
+            Use patched Netinstall.
+          files: |
+            output/routeros-arm-6.48.6.npk
+            output/option-6.48.6-arm.npk
+            output/all_packages-arm-6.48.6.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
