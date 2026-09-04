@@ -1,0 +1,198 @@
+name: Build RouterOS 7.5 x86 (+option)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f patch.py
+          test -f npk.py
+          test -n "${CUSTOM_NPK_SIGN_PRIVATE_KEY}"
+          test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
+          python3 -m py_compile patch.py npk.py
+          # 仓库里要有 busybox/busybox_x86（FUjr 结构）
+          if [ ! -f busybox/busybox_x86 ]; then
+            echo "WARN: busybox/busybox_x86 missing, will download from FUjr/elseif"
+          fi
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools zip unzip
+
+      - name: Build 7.5 x86 + option
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+
+          VERSION="7.5"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/all_packages" "$WORK/option-root/bin" "$OUT"
+
+          # ---------- 1) busybox / keygen ----------
+          mkdir -p busybox keygen
+          if [ ! -f busybox/busybox_x86 ]; then
+            wget -nv -O busybox/busybox_x86 \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_x86" \
+            || wget -nv -O busybox/busybox_x86 \
+              "https://raw.githubusercontent.com/elseif/MikroTikPatch/main/busybox/busybox_x86"
+          fi
+          if [ ! -f keygen/keygen_x86 ]; then
+            wget -nv -O keygen/keygen_x86 \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/keygen/keygen_x86" \
+            || wget -nv -O keygen/keygen_x86 \
+              "https://raw.githubusercontent.com/elseif/MikroTikPatch/main/keygen/keygen_x86" || true
+          fi
+          chmod +x busybox/busybox_x86
+          file busybox/busybox_x86
+          # 必须是 x86-64 静态或可在 ROS 里跑的 ELF
+          file busybox/busybox_x86 | grep -qiE "x86-64|Intel 80386|ELF" || {
+            echo "ERROR: busybox_x86 not a valid x86 ELF"
+            exit 1
+          }
+
+          # ---------- 2) 做 option.sfs（对齐 FUjr/elseif）----------
+          cp busybox/busybox_x86 "$WORK/option-root/bin/busybox"
+          chmod +x "$WORK/option-root/bin/busybox"
+          if [ -f keygen/keygen_x86 ]; then
+            cp keygen/keygen_x86 "$WORK/option-root/bin/keygen"
+            chmod +x "$WORK/option-root/bin/keygen"
+          fi
+
+          COMMANDS=$(./busybox/busybox_x86 --list)
+          echo "busybox applets: $(echo $COMMANDS | wc -w)"
+          for cmd in $COMMANDS; do
+            # 软链必须指向包内最终路径
+            ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/$cmd"
+          done
+          # 确保 sh / ash 存在
+          ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/sh"
+          ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/ash"
+
+          # elseif 用 -all-root，权限更干净，避免登录后立刻 closed
+          mksquashfs "$WORK/option-root" "$WORK/option.sfs" \
+            -no-recovery -noappend -exit-on-error -quiet \
+            -comp xz -no-xattrs -b 256k -all-root
+          ls -lh "$WORK/option.sfs"
+          rm -rf "$WORK/option-root"
+
+          # ---------- 3) 下载官方包 ----------
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/routeros-${VERSION}.npk" \
+            "https://download.mikrotik.com/routeros/${VERSION}/routeros-${VERSION}.npk"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-x86-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-x86-${VERSION}.zip"
+
+          unzip -o "$WORK/all_packages-x86-${VERSION}.zip" -d "$WORK/all_packages/"
+          chmod -R u+w "$WORK/all_packages" "$WORK/routeros-${VERSION}.npk"
+          ls -lh "$WORK/all_packages/" | head -30
+
+          # ---------- 4) 创建 option-7.5.npk ----------
+          TEMPLATE=""
+          for cand in \
+            "$WORK/all_packages/gps-${VERSION}.npk" \
+            "$WORK/all_packages/ntp-${VERSION}.npk" \
+            "$WORK/all_packages/ups-${VERSION}.npk" \
+            "$WORK/all_packages/iot-${VERSION}.npk"
+          do
+            [ -f "$cand" ] && TEMPLATE="$cand" && break
+          done
+          if [ -z "$TEMPLATE" ]; then
+            TEMPLATE=$(ls "$WORK"/all_packages/*.npk | grep -vE 'routeros|system' | head -1)
+          fi
+          echo "option template: $TEMPLATE"
+          test -f "$TEMPLATE"
+
+          OPTION_NPK="$WORK/all_packages/option-${VERSION}.npk"
+          python3 npk.py create "$TEMPLATE" "$OPTION_NPK" option "$WORK/option.sfs" -desc="busybox"
+          python3 npk.py sign "$OPTION_NPK" "$OPTION_NPK"
+          ls -lh "$OPTION_NPK"
+
+          # ---------- 5) patch 主包 + sign 其余包 ----------
+          echo "[PATCH] routeros-${VERSION}.npk"
+          python3 patch.py npk "$WORK/routeros-${VERSION}.npk"
+          python3 npk.py sign "$WORK/routeros-${VERSION}.npk" "$WORK/routeros-${VERSION}.npk"
+
+          for f in "$WORK"/all_packages/*.npk; do
+            base=$(basename "$f")
+            # option 已签过；其它只 sign（与 FUjr 非内核包一致）
+            if [ "$base" = "option-${VERSION}.npk" ]; then
+              continue
+            fi
+            echo "[SIGN] $base"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          # ---------- 6) 产出 ----------
+          cp -f "$WORK/routeros-${VERSION}.npk" "$OUT/routeros-${VERSION}.npk"
+          cp -f "$OPTION_NPK" "$OUT/option-${VERSION}.npk"
+          (cd "$WORK/all_packages" && zip -r "$OUT/all_packages-x86-${VERSION}.zip" ./*.npk)
+
+          echo "=== outputs ==="
+          ls -lh "$OUT/"
+          unzip -l "$OUT/all_packages-x86-${VERSION}.zip" | grep -i option || true
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-7.5-x86-patched
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v7.5-x86-patched-${{ github.run_id }}
+          name: RouterOS 7.5 x86 (+option)
+          body: |
+            RouterOS 7.5 x86 patched (FUjr-style) with option package.
+
+            Install:
+            1. routeros-7.5.npk (main)
+            2. option-7.5.npk
+
+            Shell test:
+            - WinBox Terminal: /system/shell
+            - or: /sh
+            - SSH/Telnet: user devel, password = admin password
+
+            If telnet closes immediately, try /system/shell first to verify busybox works.
+          files: |
+            output/routeros-7.5.npk
+            output/option-7.5.npk
+            output/all_packages-x86-7.5.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
