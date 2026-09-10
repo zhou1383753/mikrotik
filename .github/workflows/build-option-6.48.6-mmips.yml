@@ -1,0 +1,147 @@
+name: Build option-6.48.6-mmips only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f npk.py
+          test -n "${CUSTOM_NPK_SIGN_PRIVATE_KEY}"
+          test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
+          python3 -m py_compile npk.py
+
+      - name: Build option-mmips only
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
+
+          VERSION="6.48.6"
+          ARCH="mmips"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/pkgs" "$WORK/option-root/bin" "$OUT"
+
+          # 1) 下载 all_packages 仅作模板
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+          unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs"
+          ls -lh "$WORK/pkgs/" | head -30
+
+          # 2) busybox_mmips（FUjr 有现成的）
+          if [ -f busybox/busybox_mmips ]; then
+            cp busybox/busybox_mmips "$WORK/busybox_mmips"
+          else
+            wget -nv -O "$WORK/busybox_mmips" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_mmips"
+          fi
+          chmod +x "$WORK/busybox_mmips"
+          file "$WORK/busybox_mmips"
+          file "$WORK/busybox_mmips" | grep -qiE "MIPS|ELF" || {
+            echo "ERROR: busybox_mmips is not a valid MIPS ELF"
+            exit 1
+          }
+
+          cp "$WORK/busybox_mmips" "$WORK/option-root/bin/busybox"
+          chmod +x "$WORK/option-root/bin/busybox"
+
+          # 3) 软链（路径必须是 /pckg/option/bin/busybox）
+          wget -nv -O "$WORK/busybox_x86" \
+            "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_x86" || true
+          COMMANDS=""
+          if [ -f "$WORK/busybox_x86" ]; then
+            chmod +x "$WORK/busybox_x86"
+            COMMANDS=$("$WORK/busybox_x86" --list 2>/dev/null || true)
+          fi
+          if [ -z "$COMMANDS" ]; then
+            COMMANDS="sh ash ls cat cp mv rm mkdir echo grep find vi tar gzip head tail free df ps kill wget"
+          fi
+          for cmd in $COMMANDS; do
+            ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/$cmd"
+          done
+          ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/sh"
+          ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/ash"
+
+          mksquashfs "$WORK/option-root" "$WORK/option.sfs" \
+            -no-recovery -noappend -exit-on-error -quiet \
+            -comp xz -no-xattrs -b 256k -all-root
+          ls -lh "$WORK/option.sfs"
+
+          # 4) 用小包当模板 create option
+          TEMPLATE=""
+          for cand in \
+            "$WORK/pkgs/gps-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ntp-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ups-${VERSION}-${ARCH}.npk"
+          do
+            [ -f "$cand" ] && TEMPLATE="$cand" && break
+          done
+          if [ -z "$TEMPLATE" ]; then
+            TEMPLATE=$(ls "$WORK"/pkgs/*.npk | grep -vE 'system|routeros' | head -1)
+          fi
+          echo "template: $TEMPLATE"
+          test -f "$TEMPLATE"
+
+          OPTION_NPK="$OUT/option-${VERSION}-${ARCH}.npk"
+          python3 npk.py create "$TEMPLATE" "$OPTION_NPK" option "$WORK/option.sfs" -desc="busybox"
+          python3 npk.py sign "$OPTION_NPK" "$OPTION_NPK"
+
+          ls -lh "$OPTION_NPK"
+          echo "OK: option-6.48.6-mmips ready"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: option-6.48.6-mmips
+          path: output/option-6.48.6-mmips.npk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v6.48.6-mmips-option-${{ github.run_id }}
+          name: option-6.48.6-mmips only
+          body: |
+            Standalone option package for existing patched RouterOS 6.48.6 mmips.
+            Does NOT modify main routeros package.
+
+            Install on a running system:
+            1. Upload option-6.48.6-mmips.npk via WinBox/Files
+            2. System → Packages → enable → reboot once
+            3. /system/shell  or  /sh
+            4. SSH/Telnet: user devel, password = admin password
+
+            Do NOT Netinstall option as the only/main package.
+          files: |
+            output/option-6.48.6-mmips.npk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
