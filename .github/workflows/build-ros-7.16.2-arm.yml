@@ -1,0 +1,260 @@
+name: Build RouterOS 7.16.2 arm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f patch.py
+          test -f npk.py
+          test -n "${CUSTOM_NPK_SIGN_PRIVATE_KEY}"
+          test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
+          python3 -m py_compile patch.py npk.py
+
+      - name: Fix patch.py initrd if needed
+        run: |
+          set -euo pipefail
+          python3 << 'PY'
+          from pathlib import Path
+          p = Path("patch.py")
+          t = p.read_text(encoding="utf-8")
+          start = t.find("def patch_initrd_xz(")
+          end = t.find("\ndef find_7zXZ_data(", start)
+          if start < 0 or end < 0:
+              print("patch_initrd_xz not found, skip")
+              raise SystemExit(0)
+          if "PRESET_EXTREME" in t[start:end] and "candidates" in t[start:end]:
+              print("already enhanced")
+              raise SystemExit(0)
+          new_fn = (
+              "def patch_initrd_xz(initrd_xz:bytes,key_dict:dict,ljust=True):\n"
+              "    initrd = lzma.decompress(initrd_xz)\n"
+              "    new_initrd = initrd\n"
+              "    for old_public_key,new_public_key in key_dict.items():\n"
+              "        if old_public_key in new_initrd:\n"
+              "            print(f'initrd public key patched {old_public_key[:16].hex().upper()}...')\n"
+              "            new_initrd = new_initrd.replace(old_public_key,new_public_key)\n"
+              "    candidates = []\n"
+              "    trials = [\n"
+              "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 4, 0, 0),\n"
+              "        (9 | lzma.PRESET_EXTREME, 32*1024*1024, 3, 0, 2),\n"
+              "        (9 | lzma.PRESET_EXTREME, 16*1024*1024, 3, 0, 2),\n"
+              "        (9 | lzma.PRESET_EXTREME, 8*1024*1024, 3, 0, 2),\n"
+              "        (9, None, None, None, None),\n"
+              "        (8, None, None, None, None),\n"
+              "        (7, None, None, None, None),\n"
+              "        (6, None, None, None, None),\n"
+              "    ]\n"
+              "    for preset, dict_size, lc, lp, pb in trials:\n"
+              "        filt = {'id': lzma.FILTER_LZMA2, 'preset': preset}\n"
+              "        if dict_size is not None:\n"
+              "            filt['dict_size'] = dict_size\n"
+              "        if lc is not None:\n"
+              "            filt['lc'] = lc; filt['lp'] = lp; filt['pb'] = pb\n"
+              "        try:\n"
+              "            out = lzma.compress(new_initrd, check=lzma.CHECK_CRC32, filters=[filt])\n"
+              "            candidates.append(out)\n"
+              "            print(f'trial size={len(out)}')\n"
+              "        except Exception as e:\n"
+              "            print('trial failed:', e)\n"
+              "    if not candidates:\n"
+              "        raise RuntimeError('no compress candidates')\n"
+              "    new_initrd_xz = min(candidates, key=len)\n"
+              "    print(f'new initrd xz size:{len(new_initrd_xz)}')\n"
+              "    print(f'old initrd xz size:{len(initrd_xz)}')\n"
+              "    if len(new_initrd_xz) > len(initrd_xz):\n"
+              "        raise AssertionError(f'new initrd xz size is too big')\n"
+              "    if ljust:\n"
+              "        print(f'ljust size:{len(initrd_xz)-len(new_initrd_xz)}')\n"
+              "        new_initrd_xz = new_initrd_xz.ljust(len(initrd_xz), bytes([0]))\n"
+              "    return new_initrd_xz\n"
+              "\n"
+          )
+          p.write_text(t[:start] + new_fn + t[end:], encoding="utf-8")
+          print("patch_initrd_xz enhanced")
+          PY
+          python3 -m py_compile patch.py
+
+      - name: Build 7.16.2 arm
+        env:
+          MIKRO_NPK_SIGN_PUBLIC_KEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_NPK_SIGN_PUBLIC_LKEY: "C293CED638A2A33C681FC8DE98EE26C54EADC5390C2DFCE197D35C83C416CF59"
+          MIKRO_LICENSE_PUBLIC_KEY: "8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32"
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+          MIKRO_UPGRADE_URL: "https://upgrade.mikrotik.com/"
+          CUSTOM_UPGRADE_URL: "http://127.0.0.1/my_custom_upgrade/"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools file
+
+          VERSION="7.16.2"
+          ARCH="arm"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/pkgs" "$WORK/option-root/bin" "$OUT"
+
+          # ROS7 命名: routeros-7.16.2-arm.npk
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/routeros-${VERSION}-${ARCH}.npk" \
+            "https://download.mikrotik.com/routeros/${VERSION}/routeros-${VERSION}-${ARCH}.npk"
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+
+          echo "Official routeros size: $(stat -c%s "$WORK/routeros-${VERSION}-${ARCH}.npk") bytes"
+          unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs" "$WORK/routeros-${VERSION}-${ARCH}.npk"
+          ls -lh "$WORK/pkgs/" | head -40
+
+          # ---------- option（与已成功的 arm option 相同）----------
+          if [ -f busybox/busybox_arm ]; then
+            cp busybox/busybox_arm "$WORK/busybox_arm"
+          else
+            wget -nv -O "$WORK/busybox_arm" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_arm" \
+            || wget -nv -O "$WORK/busybox_arm" \
+              "https://raw.githubusercontent.com/elseif/MikroTikPatch/ee6d299e/busybox/busybox_arm"
+          fi
+          chmod +x "$WORK/busybox_arm"
+          file "$WORK/busybox_arm"
+          test "$(stat -c%s "$WORK/busybox_arm")" -gt 100000
+
+          if [ -f keygen/keygen_arm ]; then
+            cp keygen/keygen_arm "$WORK/keygen_arm" || true
+          else
+            wget -nv -O "$WORK/keygen_arm" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/keygen/keygen_arm" || true
+          fi
+
+          sudo cp "$WORK/busybox_arm" "$WORK/option-root/bin/busybox"
+          sudo chmod +x "$WORK/option-root/bin/busybox"
+          if [ -s "$WORK/keygen_arm" ]; then
+            sudo cp "$WORK/keygen_arm" "$WORK/option-root/bin/keygen"
+            sudo chmod +x "$WORK/option-root/bin/keygen"
+          fi
+
+          if [ -f busybox/busybox_x86 ]; then
+            chmod +x busybox/busybox_x86
+            COMMANDS=$(./busybox/busybox_x86 --list)
+          else
+            wget -nv -O "$WORK/busybox_x86" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_x86"
+            chmod +x "$WORK/busybox_x86"
+            COMMANDS=$("$WORK/busybox_x86" --list)
+          fi
+          for cmd in $COMMANDS; do
+            sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/$cmd"
+          done
+          sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/sh"
+          sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/ash"
+
+          sudo mksquashfs "$WORK/option-root" "$WORK/option.sfs" \
+            -quiet -comp xz -no-xattrs -b 256k
+          sudo rm -rf "$WORK/option-root"
+
+          TEMPLATE=""
+          for cand in \
+            "$WORK/pkgs/gps-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ntp-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ups-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/iot-${VERSION}-${ARCH}.npk"
+          do
+            [ -f "$cand" ] && TEMPLATE="$cand" && break
+          done
+          if [ -z "$TEMPLATE" ]; then
+            TEMPLATE=$(ls "$WORK"/pkgs/*.npk | grep -vE 'routeros|system|wireless' | head -1)
+          fi
+          echo "option template: $TEMPLATE"
+          OPTION_NPK="$WORK/pkgs/option-${VERSION}-${ARCH}.npk"
+          python3 npk.py create "$TEMPLATE" "$OPTION_NPK" option "$WORK/option.sfs" -desc="busybox"
+          python3 npk.py sign "$OPTION_NPK" "$OPTION_NPK"
+          ls -lh "$OPTION_NPK"
+
+          # ---------- 主包：patch + sign ----------
+          echo "[PATCH] routeros-${VERSION}-${ARCH}.npk"
+          python3 patch.py npk "$WORK/routeros-${VERSION}-${ARCH}.npk"
+          python3 npk.py sign "$WORK/routeros-${VERSION}-${ARCH}.npk" "$WORK/routeros-${VERSION}-${ARCH}.npk"
+
+          FINAL="$WORK/routeros-${VERSION}-${ARCH}.npk"
+          SIZE=$(stat -c%s "$FINAL")
+          echo "Final routeros size: $SIZE bytes"
+          if [ "$SIZE" -lt 5000000 ]; then
+            echo "ERROR: final package too small"
+            exit 1
+          fi
+
+          # ---------- all_packages：只 sign（option 已签过）----------
+          for f in "$WORK"/pkgs/*.npk; do
+            base=$(basename "$f")
+            if [[ "$base" == option-* ]]; then
+              echo "[SKIP] $base"
+              continue
+            fi
+            echo "[SIGN] $base"
+            python3 npk.py sign "$f" "$f"
+          done
+
+          # 产出
+          cp -f "$FINAL" "$OUT/routeros-${VERSION}-${ARCH}.npk"
+          cp -f "$OPTION_NPK" "$OUT/option-${VERSION}-${ARCH}.npk"
+          (cd "$WORK/pkgs" && zip -r "$OUT/all_packages-${ARCH}-${VERSION}.zip" ./*.npk)
+
+          echo "=== outputs ==="
+          ls -lh "$OUT/"
+          unzip -l "$OUT/all_packages-${ARCH}-${VERSION}.zip" | head -40
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouterOS-7.16.2-Patched-arm
+          path: output/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v7.16.2-arm-patched-${{ github.run_id }}
+          name: RouterOS 7.16.2 arm (main + all_packages + option)
+          body: |
+            RouterOS 7.16.2 arm patched (FUjr-style).
+
+            Assets:
+            - routeros-7.16.2-arm.npk
+            - option-7.16.2-arm.npk
+            - all_packages-arm-7.16.2.zip (includes option)
+
+            Netinstall: patched Netinstall + routeros-7.16.2-arm.npk
+            Then upload/enable option if needed.
+            Shell: /system shell
+          files: |
+            output/routeros-7.16.2-arm.npk
+            output/option-7.16.2-arm.npk
+            output/all_packages-arm-7.16.2.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
