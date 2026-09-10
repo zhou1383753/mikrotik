@@ -1,0 +1,179 @@
+name: Build option-7.16.2-arm only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -f npk.py
+          test -n "${CUSTOM_NPK_SIGN_PRIVATE_KEY}"
+          test -n "${CUSTOM_LICENSE_PRIVATE_KEY}"
+          python3 -m py_compile npk.py
+
+      - name: Build option-arm only
+        env:
+          CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
+          CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
+          CUSTOM_NPK_SIGN_PUBLIC_KEY: "9BA63F05E55C293AFA9D961F9C43675D990252A158358986F5BB699700014709"
+          CUSTOM_LICENSE_PUBLIC_KEY: "52AC2A5C0DC7D1405E96EA6965A17BAA13C2A6EA010A567B9216A3A6F7970462"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools file
+
+          VERSION="7.16.2"
+          ARCH="arm"
+          WORK="$PWD/build"
+          OUT="$PWD/output"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK/pkgs" "$WORK/option-root/bin" "$OUT"
+
+          # 1) 官方 all_packages 仅作模板
+          wget --retry-connrefused --waitretry=5 --tries=5 --timeout=60 --show-progress \
+            -O "$WORK/all_packages-${ARCH}-${VERSION}.zip" \
+            "https://download.mikrotik.com/routeros/${VERSION}/all_packages-${ARCH}-${VERSION}.zip"
+          unzip -o "$WORK/all_packages-${ARCH}-${VERSION}.zip" -d "$WORK/pkgs/"
+          chmod -R u+w "$WORK/pkgs"
+          ls -lh "$WORK/pkgs/" | head -40
+
+          # 2) busybox_arm（优先仓库，否则 FUjr / elseif 历史）
+          if [ -f busybox/busybox_arm ]; then
+            cp busybox/busybox_arm "$WORK/busybox_arm"
+          else
+            wget -nv -O "$WORK/busybox_arm" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_arm" \
+            || wget -nv -O "$WORK/busybox_arm" \
+              "https://raw.githubusercontent.com/elseif/MikroTikPatch/ee6d299e/busybox/busybox_arm"
+          fi
+          chmod +x "$WORK/busybox_arm"
+          file "$WORK/busybox_arm"
+          BB_SIZE=$(stat -c%s "$WORK/busybox_arm")
+          echo "busybox size: $BB_SIZE"
+          if [ "$BB_SIZE" -lt 100000 ]; then
+            echo "ERROR: busybox_arm too small / download failed"
+            exit 1
+          fi
+          file "$WORK/busybox_arm" | grep -qiE "ARM|ELF" || {
+            echo "ERROR: busybox_arm is not ARM ELF"
+            file "$WORK/busybox_arm"
+            exit 1
+          }
+
+          # 可选 keygen_arm
+          if [ -f keygen/keygen_arm ]; then
+            cp keygen/keygen_arm "$WORK/keygen_arm"
+          else
+            wget -nv -O "$WORK/keygen_arm" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/keygen/keygen_arm" \
+            || wget -nv -O "$WORK/keygen_arm" \
+              "https://raw.githubusercontent.com/elseif/MikroTikPatch/ee6d299e/keygen/keygen_arm" || true
+          fi
+
+          sudo cp "$WORK/busybox_arm" "$WORK/option-root/bin/busybox"
+          sudo chmod +x "$WORK/option-root/bin/busybox"
+          if [ -s "$WORK/keygen_arm" ]; then
+            sudo cp "$WORK/keygen_arm" "$WORK/option-root/bin/keygen"
+            sudo chmod +x "$WORK/option-root/bin/keygen"
+          fi
+
+          # 3) 软链（路径必须是 /pckg/option/bin/busybox）
+          if [ -f busybox/busybox_x86 ]; then
+            chmod +x busybox/busybox_x86
+            COMMANDS=$(./busybox/busybox_x86 --list)
+          else
+            wget -nv -O "$WORK/busybox_x86" \
+              "https://raw.githubusercontent.com/FUjr/MikroTikPatch/main/busybox/busybox_x86"
+            chmod +x "$WORK/busybox_x86"
+            COMMANDS=$("$WORK/busybox_x86" --list)
+          fi
+          for cmd in $COMMANDS; do
+            sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/$cmd"
+          done
+          sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/sh"
+          sudo ln -sf /pckg/option/bin/busybox "$WORK/option-root/bin/ash"
+
+          # 4) squashfs：与 FUjr 7.x 一致
+          sudo mksquashfs "$WORK/option-root" "$WORK/option.sfs" \
+            -quiet -comp xz -no-xattrs -b 256k
+          ls -lh "$WORK/option.sfs"
+          sudo rm -rf "$WORK/option-root"
+
+          # 5) 模板：同版本 arm 小包
+          TEMPLATE=""
+          for cand in \
+            "$WORK/pkgs/gps-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ntp-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/ups-${VERSION}-${ARCH}.npk" \
+            "$WORK/pkgs/iot-${VERSION}-${ARCH}.npk"
+          do
+            [ -f "$cand" ] && TEMPLATE="$cand" && break
+          done
+          if [ -z "$TEMPLATE" ]; then
+            TEMPLATE=$(ls "$WORK"/pkgs/*.npk | grep -vE 'routeros|system|wireless' | head -1)
+          fi
+          echo "template: $TEMPLATE"
+          test -f "$TEMPLATE"
+          ls -lh "$TEMPLATE"
+
+          OPTION_NPK="$OUT/option-${VERSION}-${ARCH}.npk"
+          python3 npk.py create "$TEMPLATE" "$OPTION_NPK" option "$WORK/option.sfs" -desc="busybox"
+          python3 npk.py sign "$OPTION_NPK" "$OPTION_NPK"
+
+          OPT_SIZE=$(stat -c%s "$OPTION_NPK")
+          echo "option size: $OPT_SIZE"
+          if [ "$OPT_SIZE" -lt 50000 ]; then
+            echo "ERROR: option too small"
+            exit 1
+          fi
+          ls -lh "$OPTION_NPK"
+          echo "OK: option-7.16.2-arm ready"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: option-7.16.2-arm
+          path: output/option-7.16.2-arm.npk
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v7.16.2-arm-option-${{ github.run_id }}
+          name: option-7.16.2-arm only
+          body: |
+            Standalone option for RouterOS 7.16.2 arm (cAP ac etc).
+            Does NOT modify main routeros package.
+
+            Install on a running 7.16.2 arm system:
+            1. Upload option-7.16.2-arm.npk
+            2. /system package enable option  (or WinBox enable) → reboot once
+            3. Test: /system shell
+               Should drop to Linux prompt; then try: ls -a
+            4. Optional: telnet 127.0.0.1 user devel password=admin password
+
+            Do NOT Netinstall option as the only package.
+          files: |
+            output/option-7.16.2-arm.npk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
